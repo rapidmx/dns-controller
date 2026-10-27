@@ -1,0 +1,111 @@
+name: Build
+
+on:
+  push:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    container:
+      image: node:24-trixie-slim
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Enable corepack
+        run: corepack enable
+
+      - name: Cache node_modules, dist
+        uses: actions/cache@v5
+        with:
+          path: |
+            node_modules
+            dist
+          key: ${{ runner.os }}-yarn-${{ hashFiles('yarn.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-yarn-
+
+      - name: Install dependencies
+        run: yarn install --immutable
+
+      - name: Build
+        run: yarn build
+
+      - name: Lint
+        run: yarn lint
+
+  test:
+    runs-on: ubuntu-latest
+    needs: build
+    container:
+      image: node:24-trixie-slim
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Enable corepack
+        run: corepack enable
+
+      - name: Restore node_modules cache
+        uses: actions/cache@v5
+        with:
+          path: node_modules
+          key: ${{ runner.os }}-yarn-${{ hashFiles('yarn.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-yarn-
+
+      - name: Install dependencies
+        run: yarn install --immutable
+
+      - name: Run tests
+        run: yarn test
+
+      - name: Upload JUnit report
+        if: always()
+        uses: actions/upload-artifact@v6
+        with:
+          name: junit
+          path: junit.xml
+
+      - name: Report coverage to Coveralls
+        uses: coverallsapp/github-action@v2
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          file: ./coverage/lcov.info
+
+  # The image the publish workflow pushes is built from the same Dockerfile; build it on every push so a broken image
+  # fails Build, which blocks the release.
+  test-docker-build:
+    runs-on: ubuntu-latest
+    needs: test
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Docker build test
+        run: |
+          docker build -t ${{ github.event.repository.name }}:ci . --no-cache
+          # With no configuration the controller must start, log start_failed and exit 1, on a read-only root.
+          set +e
+          docker run --rm --read-only --cap-drop ALL ${{ github.event.repository.name }}:ci
+          code=$?
+          set -e
+          if [ "$code" -ne 1 ]; then
+            echo "::error::Expected the image to exit 1 on a missing configuration, got $code."
+            exit 1
+          fi
+          docker rmi ${{ github.event.repository.name }}:ci
+
+  validate:
+    runs-on: ubuntu-latest
+    needs: build
+    container:
+      image: node:24-trixie-slim
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Enable corepack
+        run: corepack enable
+
+      - name: Run validation script
+        run: |
+          set +e
+          bash ./validate.sh

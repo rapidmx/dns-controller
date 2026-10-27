@@ -1,0 +1,9 @@
+.claude
+.git
+.github
+.vscode
+*.log
+coverage
+dist
+junit.xml
+node_modules

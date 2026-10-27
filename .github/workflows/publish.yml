@@ -1,0 +1,120 @@
+name: Publish
+
+on:
+  workflow_run:
+    workflows: ["Build"]
+    types:
+      - completed
+
+permissions:
+  contents: read
+
+jobs:
+  # A release pushes main and its tag at the same commit, and each push runs Build. Publish only from the tag's own Build,
+  # and only once every Build of that commit has finished green: a failed run on either ref (even one that passes when
+  # rerun) blocks the release until it is rerun green, which triggers this workflow again.
+  check:
+    runs-on: ubuntu-latest
+    if: >-
+      github.event.workflow_run.conclusion == 'success' &&
+      github.event.workflow_run.event == 'push' &&
+      startsWith(github.event.workflow_run.head_branch, 'v')
+    permissions:
+      actions: read
+      contents: read
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: ${{ github.event.workflow_run.head_sha }}
+          fetch-depth: 0
+
+      - name: Require a release tag on main and every Build of its commit green
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          SHA: ${{ github.event.workflow_run.head_sha }}
+          TAG: ${{ github.event.workflow_run.head_branch }}
+          WORKFLOW_ID: ${{ github.event.workflow_run.workflow_id }}
+        run: |
+          set -euo pipefail
+          if ! git tag --points-at HEAD | grep -qxF "$TAG" || ! git merge-base --is-ancestor HEAD origin/main; then
+            echo "::error::Tag $TAG doesn't point at $SHA on main; not publishing."
+            exit 1
+          fi
+          url="repos/$REPO/actions/workflows/$WORKFLOW_ID/runs?head_sha=$SHA&per_page=100"
+          for attempt in $(seq 1 90); do
+            pending=$(gh api "$url" --jq '[.workflow_runs[] | select(.status != "completed")] | length')
+            failed=$(gh api "$url" --jq '[.workflow_runs[] | select(.status == "completed" and .conclusion != "success")
+              | "\(.id) (\(.head_branch)): \(.conclusion)"] | join(", ")')
+            if [ -n "$failed" ]; then
+              echo "::error::Not publishing $TAG: a Build of $SHA did not succeed: $failed. Rerun it; a green rerun triggers this workflow again."
+              exit 1
+            fi
+            if [ "$pending" = 0 ]; then
+              echo "Every Build of $SHA succeeded: $(gh api "$url" --jq '[.workflow_runs[] | "\(.id) (\(.head_branch))"] | join(", ")')"
+              exit 0
+            fi
+            sleep 20
+          done
+          echo "::error::Timed out waiting for the other Builds of $SHA to finish."
+          exit 1
+
+  # The image only: the RapidMX server chart templates the controller and pins this image's version (no chart here).
+  publish-docker-image:
+    needs: check
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    environment: publish
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: ${{ github.event.workflow_run.head_sha }}
+
+      - name: Image name and version
+        id: image
+        env:
+          TAG: ${{ github.event.workflow_run.head_branch }}
+        run: |
+          name=$(jq -r .name package.json)
+          version=$(jq -r .version package.json)
+          if [ "v$version" != "$TAG" ]; then
+            echo "::error::package.json version $version does not match tag $TAG."
+            exit 1
+          fi
+          echo "repository=ghcr.io/${{ github.repository_owner }}/$name" >> "$GITHUB_OUTPUT"
+          echo "name=$name" >> "$GITHUB_OUTPUT"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
+      - name: Log in to GHCR
+        run: |
+          echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io \
+            -u ${{ github.actor }} \
+            --password-stdin
+
+      - name: Build image
+        # No build cache in release builds.
+        run: docker build --no-cache --pull -t "${{ steps.image.outputs.repository }}:${{ steps.image.outputs.version }}" .
+
+      - name: Push image
+        # A prerelease (1.0.0-beta.N) must never become `latest`.
+        run: |
+          IMAGE="${{ steps.image.outputs.repository }}"
+          VERSION="${{ steps.image.outputs.version }}"
+          docker push "$IMAGE:$VERSION"
+          if [[ "$VERSION" != *-* ]]; then
+            docker tag "$IMAGE:$VERSION" "$IMAGE:latest"
+            docker push "$IMAGE:latest"
+          fi
+          echo "Published $IMAGE:$VERSION ($(docker inspect --format '{{index .RepoDigests 0}}' "$IMAGE:$VERSION"))" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Make package public
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          curl -fsS -X PATCH \
+            -H "Accept: application/vnd.github+json" \
+            -H "Authorization: Bearer $GH_TOKEN" \
+            "https://api.github.com/orgs/${{ github.repository_owner }}/packages/container/${{ steps.image.outputs.name }}/visibility" \
+            -d '{"visibility":"public"}' || echo "::warning::Could not make the package public; set its visibility by hand."

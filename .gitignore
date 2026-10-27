@@ -1,0 +1,19 @@
+node_modules
+/yarn-error.log
+/dist
+/coverage
+junit.xml
+tmp-*
+logger.log
+loggererror.log
+.pnp.*
+.yarn/*
+!.yarn/patches
+!.yarn/plugins
+!.yarn/releases
+!.yarn/sdks
+!.yarn/versions
+**/.idea
+/profiles
+# Local environment overrides - never commit real secrets.
+.env
