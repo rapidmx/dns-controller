@@ -2,10 +2,13 @@ import { readFileSync } from "node:fs";
 import {
     API_VERSION_V1,
     ApiVersionError,
+    DnsApiPayloadError,
     expectV1,
+    parseDesiredState,
     SUPPORTED_API_VERSIONS,
     versionPath,
     type DesiredStateV1,
+    type StatusReportResultV1,
     type StatusReportV1,
 } from "../../src/api/v1.js";
 
@@ -54,5 +57,162 @@ describe("API v1", () => {
         expect(() => expectV1(fixture("status-report"), "DesiredState")).toThrow('expected kind DesiredState, got "StatusReport"');
         expect(() => expectV1(null, "DesiredState")).toThrow("expected a DesiredState object");
         expect(() => expectV1("x", "DesiredState")).toThrow(ApiVersionError);
+    });
+
+    it("names the server's answer to a status report", () => {
+        const answer = expectV1<StatusReportResultV1>({ apiVersion: API_VERSION_V1, kind: "StatusReportResult" }, "StatusReportResult");
+        expect(answer.kind).toBe("StatusReportResult");
+    });
+});
+
+describe("parseDesiredState", () => {
+    /** A copy of the fixture with `patch` applied. */
+    function state(patch: (s: any) => unknown = () => undefined): any {
+        const s: any = fixture("desired-state");
+        patch(s);
+        return s;
+    }
+
+    it("reads the shared fixture, leaving out the fields v1 does not define", () => {
+        const parsed: DesiredStateV1 = parseDesiredState(fixture("desired-state"));
+        expect(parsed).toEqual({
+            apiVersion: "dns.rapidmx.io/v1",
+            kind: "DesiredState",
+            version: 42,
+            ownerId: "rapidmx-k3x9q2m7a1b4c8d0",
+            externalDnsImage: "registry.k8s.io/external-dns/external-dns:v0.23.0",
+            providers: [
+                {
+                    uid: "cloudflare-main",
+                    type: "cloudflare",
+                    zones: ["example.com"],
+                    options: { zoneIds: ["0123456789abcdef0123456789abcdef"] },
+                    secretRef: { backend: "openbao", path: "dns/cloudflare-main", keys: ["apiToken"], generation: 1 },
+                    enabled: true,
+                },
+            ],
+            endpointSets: [
+                {
+                    id: "domain-example-com",
+                    providerUid: "cloudflare-main",
+                    domainUid: "example.com",
+                    records: [
+                        { dnsName: "example.com", recordType: "MX", targets: ["10 mail.example.com"], ttl: 300 },
+                        { dnsName: "_rapidmx-verify.example.com", recordType: "TXT", targets: ["rapidmx-domain-verification=3f9c1d"], ttl: 300 },
+                    ],
+                },
+            ],
+            operations: [],
+        });
+        expect(parsed).not.toHaveProperty("futureField");
+    });
+
+    it("reads every optional field: no secret, the hosts' set, options of every type, operations with and without records", () => {
+        const parsed = parseDesiredState(
+            state((s) => {
+                s.providers.push({
+                    uid: "bind",
+                    type: "rfc2136",
+                    zones: ["example.org"],
+                    options: { hosts: ["10.0.0.53"], port: 53, insecure: true, zone: "example.org" },
+                    secretRef: null,
+                    enabled: false,
+                    unknown: 1,
+                });
+                s.endpointSets.push({ id: "hosts-bind", providerUid: "bind", records: [{ dnsName: "mail.example.org", recordType: "A", targets: ["203.0.113.7"] }] });
+                s.operations.push(
+                    { id: "op-1", type: "test", providerUid: "bind" },
+                    {
+                        id: "op-2",
+                        type: "takeover",
+                        providerUid: "cloudflare-main",
+                        endpointSetId: "domain-example-com",
+                        records: [{ dnsName: "example.com", recordType: "MX", targets: ["10 mail.example.com"], ttl: 300 }],
+                    }
+                );
+            })
+        );
+        expect(parsed.providers[1]).toEqual({
+            uid: "bind",
+            type: "rfc2136",
+            zones: ["example.org"],
+            options: { hosts: ["10.0.0.53"], port: 53, insecure: true, zone: "example.org" },
+            enabled: false,
+        });
+        expect(parsed.endpointSets[1]).toEqual({
+            id: "hosts-bind",
+            providerUid: "bind",
+            records: [{ dnsName: "mail.example.org", recordType: "A", targets: ["203.0.113.7"] }],
+        });
+        expect(parsed.operations).toEqual([
+            { id: "op-1", type: "test", providerUid: "bind" },
+            {
+                id: "op-2",
+                type: "takeover",
+                providerUid: "cloudflare-main",
+                endpointSetId: "domain-example-com",
+                records: [{ dnsName: "example.com", recordType: "MX", targets: ["10 mail.example.com"], ttl: 300 }],
+            },
+        ]);
+    });
+
+    it("refuses another version or kind as a version mismatch", () => {
+        expect(() => parseDesiredState(state((s) => (s.apiVersion = "dns.rapidmx.io/v2")))).toThrow(ApiVersionError);
+        expect(() => parseDesiredState(fixture("status-report"))).toThrow(ApiVersionError);
+    });
+
+    const options = "must be text, a number, a switch or a list of text";
+    it.each([
+        ["version", (s: any) => (s.version = -1), "'version' must be a whole number"],
+        ["version", (s: any) => (s.version = "42"), "'version' must be a whole number"],
+        ["ownerId", (s: any) => (s.ownerId = ""), "'ownerId' must be text"],
+        ["externalDnsImage", (s: any) => delete s.externalDnsImage, "'externalDnsImage' must be text"],
+        ["providers", (s: any) => (s.providers = {}), "'providers' must be a list"],
+        ["providers", (s: any) => (s.providers = [null]), "'providers[0]' must be an object"],
+        ["providers", (s: any) => (s.providers[0].uid = 7), "'providers[0].uid' must be text"],
+        ["providers", (s: any) => (s.providers[0].type = "digitalocean"), "'providers[0].type' is not a provider type this controller knows"],
+        ["providers", (s: any) => (s.providers[0].zones = ["example.com", ""]), "'providers[0].zones' must be a list of text"],
+        ["providers", (s: any) => (s.providers[0].zones = "example.com"), "'providers[0].zones' must be a list of text"],
+        ["providers", (s: any) => (s.providers[0].options = []), "'providers[0].options' must be an object"],
+        ["providers", (s: any) => (s.providers[0].options = null), "'providers[0].options' must be an object"],
+        ["providers", (s: any) => (s.providers[0].options = { zoneIds: [1] }), `'providers[0].options.zoneIds' ${options}`],
+        ["providers", (s: any) => (s.providers[0].options = { ttl: Infinity }), `'providers[0].options.ttl' ${options}`],
+        ["providers", (s: any) => (s.providers[0].options = { nested: {} }), `'providers[0].options.nested' ${options}`],
+        ["providers", (s: any) => (s.providers[0].secretRef = "dns/x"), "'providers[0].secretRef' must be a secret reference"],
+        ["providers", (s: any) => (s.providers[0].secretRef.backend = "vault"), "'providers[0].secretRef' must be a secret reference"],
+        ["providers", (s: any) => (s.providers[0].secretRef.path = ""), "'providers[0].secretRef' must be a secret reference"],
+        ["providers", (s: any) => (s.providers[0].secretRef.keys = [3]), "'providers[0].secretRef' must be a secret reference"],
+        ["providers", (s: any) => (s.providers[0].secretRef.generation = 1.5), "'providers[0].secretRef' must be a secret reference"],
+        ["providers", (s: any) => (s.providers[0].enabled = "true"), "'providers[0].enabled' must be true or false"],
+        ["endpointSets", (s: any) => (s.endpointSets = undefined), "'endpointSets' must be a list"],
+        ["endpointSets", (s: any) => (s.endpointSets[0].id = ""), "'endpointSets[0].id' must be text"],
+        ["endpointSets", (s: any) => (s.endpointSets[0].providerUid = null), "'endpointSets[0].providerUid' must be text"],
+        ["endpointSets", (s: any) => (s.endpointSets[0].domainUid = 1), "'endpointSets[0].domainUid' must be text"],
+        ["endpointSets", (s: any) => (s.endpointSets[0].records = null), "'endpointSets[0].records' must be a list"],
+        ["endpointSets", (s: any) => (s.endpointSets[0].records[1] = "x"), "'endpointSets[0].records[1]' must be an object"],
+        ["endpointSets", (s: any) => (s.endpointSets[0].records[0].dnsName = ""), "'endpointSets[0].records[0].dnsName' must be text"],
+        [
+            "endpointSets",
+            (s: any) => (s.endpointSets[0].records[0].recordType = "NS"),
+            "'endpointSets[0].records[0].recordType' is not a record type this controller knows",
+        ],
+        ["endpointSets", (s: any) => (s.endpointSets[0].records[0].targets = []), "'endpointSets[0].records[0].targets' must be a list of text"],
+        ["endpointSets", (s: any) => (s.endpointSets[0].records[0].targets = [""]), "'endpointSets[0].records[0].targets' must be a list of text"],
+        ["endpointSets", (s: any) => (s.endpointSets[0].records[0].ttl = -5), "'endpointSets[0].records[0].ttl' must be a whole number"],
+        ["operations", (s: any) => (s.operations = "none"), "'operations' must be a list"],
+        ["operations", (s: any) => s.operations.push({ id: "", type: "test", providerUid: "p" }), "'operations[0].id' must be text"],
+        ["operations", (s: any) => s.operations.push({ id: "o", type: "wipe", providerUid: "p" }), "'operations[0].type' is not an operation this controller knows"],
+        ["operations", (s: any) => s.operations.push({ id: "o", type: "test" }), "'operations[0].providerUid' must be text"],
+        ["operations", (s: any) => s.operations.push({ id: "o", type: "test", providerUid: "p", endpointSetId: 3 }), "'operations[0].endpointSetId' must be text"],
+        ["operations", (s: any) => s.operations.push({ id: "o", type: "restore", providerUid: "p", records: {} }), "'operations[0].records' must be a list"],
+    ])("refuses the whole state when %s is malformed, naming the field, never a value", (_field, patch, message) => {
+        let err: unknown;
+        try {
+            parseDesiredState(state(patch));
+        } catch (e) {
+            err = e;
+        }
+        expect(err).toBeInstanceOf(DnsApiPayloadError);
+        expect(err).toMatchObject({ name: "DnsApiPayloadError", message });
     });
 });

@@ -5,9 +5,12 @@
 // Wires the controller together. The process entry point is main.ts; everything here takes its environment and its
 // I/O seams as arguments so tests can run it without a cluster.
 import { ServerClient } from "./api/ServerClient.js";
+import { ServiceAccountTokenVerifier } from "./auth/ServiceAccountTokenVerifier.js";
 import { loadConfig, type ControllerConfig } from "./config.js";
 import { Controller } from "./Controller.js";
+import { DesiredStateSync } from "./DesiredStateSync.js";
 import { HealthServer } from "./HealthServer.js";
+import { InternalApiServer } from "./InternalApiServer.js";
 import { KubeClient, type KubeTransport } from "./kube/KubeClient.js";
 import { LeaseElector } from "./kube/LeaseElector.js";
 import { Logger, stdoutSink, type LogSink } from "./log.js";
@@ -19,13 +22,17 @@ export interface Overrides {
     sink?: LogSink;
     /** Listen for health checks here instead of the configured port (0: any free port). */
     healthPort?: number;
+    /** Serve the internal API here instead of the configured port (0: any free port). */
+    apiPort?: number;
 }
 
 export interface Running {
     config: ControllerConfig;
     controller: Controller;
     elector: LeaseElector;
+    sync: DesiredStateSync;
     healthPort: number;
+    apiPort: number;
     log: Logger;
     stop(): Promise<void>;
 }
@@ -52,32 +59,54 @@ export async function startController(env: NodeJS.ProcessEnv = process.env, over
         renewIntervalSeconds: config.renewIntervalSeconds,
         log,
     });
+    const server = new ServerClient({
+        baseUrl: config.serverUrl,
+        tokenFile: config.serverTokenFile,
+        controllerVersion: version,
+        timeoutMs: config.serverTimeoutMs,
+        longPollTimeoutMs: config.longPollTimeoutSeconds * 1000,
+        fetch: overrides.fetch,
+    });
+    const sync = new DesiredStateSync({
+        server,
+        lease: elector,
+        log,
+        controllerVersion: version,
+        identity: config.holderIdentity,
+        statusIntervalSeconds: config.statusIntervalSeconds,
+    });
     const controller = new Controller({
-        server: new ServerClient({
-            baseUrl: config.serverUrl,
-            tokenFile: config.serverTokenFile,
-            controllerVersion: version,
-            timeoutMs: config.serverTimeoutMs,
-            fetch: overrides.fetch,
-        }),
+        server,
         elector,
+        sync,
         log,
         controllerVersion: version,
         handshakeRetrySeconds: config.handshakeRetrySeconds,
     });
     const health = new HealthServer(() => controller.health());
     const healthPort: number = await health.listen(overrides.healthPort ?? config.healthPort);
-    log.info("started", { version, namespace, healthPort, lease: config.leaseName, identity: config.holderIdentity });
+    // The server's calls: its projected token, verified against the cluster's keys read through this pod's own client.
+    const api = new InternalApiServer({
+        verifier: new ServiceAccountTokenVerifier({ kube, audience: config.apiAudience }),
+        subject: config.serverSubject,
+        gate: controller,
+        log,
+    });
+    const apiPort: number = await api.listen(overrides.apiPort ?? config.apiPort);
+    log.info("started", { version, namespace, healthPort, apiPort, lease: config.leaseName, identity: config.holderIdentity });
     controller.start();
 
     return {
         config,
         controller,
         elector,
+        sync,
         healthPort,
+        apiPort,
         log,
         async stop(): Promise<void> {
             await controller.stop();
+            await api.close();
             await health.close();
             log.info("stopped");
         },

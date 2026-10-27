@@ -128,7 +128,41 @@ LICENSE MPL-2.0, CONTRIBUTING) and ses-bridge/activesync's Build + Publish workf
 
 `DnsProviderV1.options` values may be `string[]` (Cloudflare's `zoneIds`, rfc2136's `hosts`): the
 server always sends `zoneIds` as a list. The shared desired-state fixture now has `zoneIds` as a list,
-changed byte-identically in restapi's `test/fixtures/dns-api/v1/` (check with `cmp`). Still to adopt
-with C3: the `StatusReportResult` kind the server answers `PUT /v1/status` with; any desired-state
+changed byte-identically in restapi's `test/fixtures/dns-api/v1/` (check with `cmp`). Adopted in
+C2 (below): the `StatusReportResult` kind the server answers `PUT /v1/status` with; any desired-state
 version other than the controller's own is a change (the server answers a `since` ahead of its
 counter at once, after a Redis reset); only the Lease holder's status report changes server rows.
+
+## 2026-10-28: DNS publishing and Integrations
+
+### Phase C2 - desired state, status reports, auth both ways
+
+Against restapi a7d6e78's `BaseDnsDesiredStateRoute`; spec 7.3 "As implemented in dns-controller C2"
+is the reference. The secret routes moved from C2 to C3 (next to the other Kubernetes writes).
+
+- `src/api/ServerClient.ts`: `desiredState(since, signal)` (`GET /v1/desired-state`, own timeout
+  `DNS_CONTROLLER_LONG_POLL_TIMEOUT_SECONDS`, 75, above the server's 55) and `reportStatus()`
+  (`PUT /v1/status`, expects `StatusReportResult`). 404, `400 unsupported_api_version` or another
+  `apiVersion`/`kind` -> back to the handshake; 401/403 is a refused token, retried, not a mismatch.
+- `parseDesiredState()` refuses a malformed state **whole** (an unknown provider type, record type or
+  operation included): dropping one entry would delete its records. Don't relax this to per-entry.
+- `src/DesiredStateSync.ts`: first request without `since`; any other version is a change; at least
+  1 s between requests; backoff 1-30 s keeping the last good state; reports after each new version and
+  every `DNS_CONTROLLER_STATUS_INTERVAL_SECONDS`, never two at once. The poll runs detached
+  (`void this.poll()`), so `onDesiredState` (C3's reconcile) is wrapped: a throw is logged
+  `desired_state_apply_failed` and the poll goes on - an escaped exception would be an unhandled
+  rejection, which ends a Node 24 process. Keep anything C3 adds inside the loop from throwing.
+- `src/auth/ServiceAccountTokenVerifier.ts`: RS256/ES256, `kid` required, issuer/audience/exp/nbf with
+  60 s skew, non-empty subject; RSA keys under 2048 bits dropped (`node:crypto` imports an empty
+  modulus). Keys from in-cluster `/openid/v1/jwks`, never the advertised `jwks_uri`; refetch at most
+  once a minute.
+- `src/InternalApiServer.ts` (8080): authenticate before routing (same 403 for everything, exact
+  subject `DNS_CONTROLLER_SERVER_SUBJECT`, required), then 400/404/405/413, then 503 `not_ready`
+  unless `mayWrite()`. No routes until C3.
+- `HealthServer`/`InternalApiServer.listen()` take no host by default (Node's `::` with its fallback
+  to `0.0.0.0`), so a single-stack IPv6 cluster reaches both ports. Don't pin `0.0.0.0` (IPv4 only)
+  or `::` (fails where the pod has no IPv6). The IPv6 tests skip where the host has no `::1` (CI's
+  container may not).
+- The shared fixtures in `test/fixtures/api/v1/` were not changed (still byte-identical to restapi's).
+  The spec edits for C2 first went out inside restapi c8da9da (a meet-plugin commit); the dates and the
+  review fixes were corrected in a later restapi commit naming the C2 spec update.

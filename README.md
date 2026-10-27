@@ -19,15 +19,16 @@ The design is in `@rapidmx/restapi`'s
 
 ## Status
 
-Phase C1, a skeleton: configuration, structured logging, health endpoints, the Kubernetes REST client, the Lease-based
-single writer, and the versioned API types with the start-up compatibility handshake. It does not manage external-dns
-yet.
+Phase C2: on top of the C1 skeleton (configuration, structured logging, health endpoints, the Kubernetes REST client,
+the Lease-based single writer, the start-up handshake), the controller reads the desired state from the server with a
+long poll, reports its status back, and authenticates the server's calls to its own internal API. It does not manage
+external-dns yet.
 
 | Phase | Scope | State |
 | --- | --- | --- |
-| C1 | Skeleton (above) | done |
-| C2 | Token verification of the server's calls, secret writes for the Kubernetes-Secret backend | planned |
-| C3 | Reconcile: desired-state long poll, external-dns Deployments, `DNSEndpoint`s, `ExternalSecret`s, status reports | planned |
+| C1 | Skeleton: configuration, logging, health, Kubernetes client, Lease, `v1` types and the handshake | done |
+| C2 | Desired-state long poll, status reports, projected-token authentication both ways | done |
+| C3 | Reconcile: external-dns Deployments, `DNSEndpoint`s, `ExternalSecret`s, per-provider and per-endpoint status, secret writes for the Kubernetes-Secret backend | planned |
 | C4 | Takeover, credentials-test and restore Jobs | planned |
 | C5 | external-dns metrics and per-provider health | planned |
 
@@ -40,7 +41,21 @@ yet.
   Lease, writes nothing, answers `/readyz` with 503 and the reason, logs `dns_api_incompatible`, and asks again every
   `DNS_CONTROLLER_HANDSHAKE_RETRY_SECONDS`. The server records the mismatch so the admin console shows it. A server that
   cannot be reached is not a mismatch: the controller stays ready and retries with backoff.
+- **Desired state.** `GET <base>/v1/desired-state` once for the whole state, then a long poll with `since=<version>`,
+  which the server answers when the version moves (or after 55 s). Any version other than the controller's own is a
+  change, a lower one too (the server's counter can be reset). A malformed state is refused whole and never acted on.
+  A server that answers 404 or `unsupported_api_version` (rolled back underneath the controller) sends it back to the
+  handshake.
+- **Status.** `PUT <base>/v1/status` after every new desired-state version and every
+  `DNS_CONTROLLER_STATUS_INTERVAL_SECONDS`, saying whether this pod holds the Lease: the server acts only on the
+  holder's report.
 - **Authentication.** Projected ServiceAccount tokens with dedicated audiences in both directions, no shared secrets.
+  The controller presents its token (audience `rapidmx-internal-dns`) on every call. On its internal API
+  (`DNS_CONTROLLER_API_PORT`) it accepts only the server's token: audience `rapidmx-dns-controller`, verified with
+  `node:crypto` against the cluster's service-account keys, fetched in-cluster from the API server
+  (`/openid/v1/jwks`, `/.well-known/openid-configuration`; the advertised `jwks_uri` is never used), and the exact
+  subject `DNS_CONTROLLER_SERVER_SUBJECT`. Every refusal is the same 403. The internal API serves nothing while the
+  controller may not write (incompatible, or not holding the Lease); its routes arrive with C3.
 
 ## Configuration
 
@@ -52,6 +67,11 @@ Set by the RapidMX server's Helm chart; listed here for reference and local runs
 | `DNS_CONTROLLER_SERVER_TOKEN_FILE` | Projected token presented to the server (default `/var/run/secrets/rapidmx/internal-dns/token`), re-read on every call |
 | `DNS_CONTROLLER_SERVER_TIMEOUT_MS` | Timeout of one call to the server (default `10000`) |
 | `DNS_CONTROLLER_HANDSHAKE_RETRY_SECONDS` | Wait before asking again after an incompatible answer (default `60`) |
+| `DNS_CONTROLLER_LONG_POLL_TIMEOUT_SECONDS` | Timeout of one desired-state long poll (default `75`; longer than the server's `mail:dns:desired_state:long_poll_seconds`, 55) |
+| `DNS_CONTROLLER_STATUS_INTERVAL_SECONDS` | How often to report status while nothing changes (default `60`) |
+| `DNS_CONTROLLER_SERVER_SUBJECT` | **Required.** The only token subject the internal API accepts: the server's ServiceAccount, `system:serviceaccount:<namespace>:<release>` |
+| `DNS_CONTROLLER_API_AUDIENCE` | The audience the server's token must carry (default `rapidmx-dns-controller`) |
+| `DNS_CONTROLLER_API_PORT` | Port of the internal API the server calls (default `8080`) |
 | `DNS_CONTROLLER_LEASE_NAME` | **Required.** The Lease that makes this the single writer (`<release>-dns-controller`) |
 | `DNS_CONTROLLER_LEASE_DURATION_SECONDS` | Lease duration (default `30`) |
 | `DNS_CONTROLLER_LEASE_RENEW_SECONDS` | Renew interval (default `10`; at most a third of the duration) |

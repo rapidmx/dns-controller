@@ -1,4 +1,7 @@
 import { HealthServer, type HealthStatus } from "../src/HealthServer.js";
+import { hasIpv6Loopback } from "./helpers/ipv6.js";
+
+const ipv6: boolean = await hasIpv6Loopback();
 
 describe("HealthServer", () => {
     let status: HealthStatus;
@@ -48,6 +51,15 @@ describe("HealthServer", () => {
     it("listens on every address by default", async () => {
         const other = new HealthServer(() => status);
         const port = await other.listen(0);
+        expect((await fetch(`http://127.0.0.1:${port}/healthz`)).status).toBe(200);
+        await other.close();
+    });
+
+    // A single-stack IPv6 cluster reaches the pod only over IPv6: a server bound to 0.0.0.0 would refuse the probes.
+    it.skipIf(!ipv6)("takes IPv6 as well as IPv4 by default", async () => {
+        const other = new HealthServer(() => status);
+        const port = await other.listen(0);
+        expect((await fetch(`http://[::1]:${port}/healthz`)).status).toBe(200);
         expect((await fetch(`http://127.0.0.1:${port}/healthz`)).status).toBe(200);
         await other.close();
     });

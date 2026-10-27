@@ -5,6 +5,7 @@ const base = {
     DNS_CONTROLLER_LEASE_NAME: "mail-dns-controller",
     KUBERNETES_SERVICE_HOST: "10.43.0.1",
     HOSTNAME: "mail-dns-controller-abc",
+    DNS_CONTROLLER_SERVER_SUBJECT: "system:serviceaccount:rapidmx:mail",
 };
 
 describe("loadConfig", () => {
@@ -14,6 +15,11 @@ describe("loadConfig", () => {
             serverTokenFile: DEFAULT_SERVER_TOKEN_FILE,
             serverTimeoutMs: 10000,
             handshakeRetrySeconds: 60,
+            longPollTimeoutSeconds: 75,
+            statusIntervalSeconds: 60,
+            serverSubject: "system:serviceaccount:rapidmx:mail",
+            apiAudience: "rapidmx-dns-controller",
+            apiPort: 8080,
             kubernetesHost: "10.43.0.1",
             kubernetesPort: "443",
             serviceAccountDir: DEFAULT_SERVICE_ACCOUNT_DIR,
@@ -33,6 +39,11 @@ describe("loadConfig", () => {
             DNS_CONTROLLER_SERVER_TOKEN_FILE: "/tok",
             DNS_CONTROLLER_SERVER_TIMEOUT_MS: "5000",
             DNS_CONTROLLER_HANDSHAKE_RETRY_SECONDS: "5",
+            DNS_CONTROLLER_LONG_POLL_TIMEOUT_SECONDS: "120",
+            DNS_CONTROLLER_STATUS_INTERVAL_SECONDS: "30",
+            DNS_CONTROLLER_SERVER_SUBJECT: " system:serviceaccount:mail-ns:rel-server ",
+            DNS_CONTROLLER_API_AUDIENCE: "custom-audience",
+            DNS_CONTROLLER_API_PORT: "9443",
             KUBERNETES_SERVICE_PORT: "6443",
             DNS_CONTROLLER_SERVICE_ACCOUNT_DIR: "/sa",
             POD_NAME: "pod-1",
@@ -46,6 +57,11 @@ describe("loadConfig", () => {
             serverTokenFile: "/tok",
             serverTimeoutMs: 5000,
             handshakeRetrySeconds: 5,
+            longPollTimeoutSeconds: 120,
+            statusIntervalSeconds: 30,
+            serverSubject: "system:serviceaccount:mail-ns:rel-server",
+            apiAudience: "custom-audience",
+            apiPort: 9443,
             kubernetesPort: "6443",
             serviceAccountDir: "/sa",
             holderIdentity: "pod-1",
@@ -81,6 +97,13 @@ describe("loadConfig", () => {
         ["DNS_CONTROLLER_LEASE_DURATION_SECONDS", { DNS_CONTROLLER_LEASE_DURATION_SECONDS: "1000" }, /from 5 to 300/],
         ["DNS_CONTROLLER_LEASE_RENEW_SECONDS", { DNS_CONTROLLER_LEASE_RENEW_SECONDS: "11" }, /at most a third/],
         ["DNS_CONTROLLER_LOG_LEVEL", { DNS_CONTROLLER_LOG_LEVEL: "verbose" }, /one of debug, info, warn, error/],
+        ["DNS_CONTROLLER_SERVER_SUBJECT", { DNS_CONTROLLER_SERVER_SUBJECT: undefined }, /DNS_CONTROLLER_SERVER_SUBJECT must be set/],
+        ["DNS_CONTROLLER_SERVER_SUBJECT", { DNS_CONTROLLER_SERVER_SUBJECT: "mail" }, /system:serviceaccount:<namespace>:<name>/],
+        ["DNS_CONTROLLER_SERVER_SUBJECT", { DNS_CONTROLLER_SERVER_SUBJECT: "system:serviceaccount:rapidmx:mail:x" }, /system:serviceaccount:<namespace>:<name>/],
+        ["DNS_CONTROLLER_SERVER_SUBJECT", { DNS_CONTROLLER_SERVER_SUBJECT: "system:serviceaccount:Rapid MX:mail" }, /system:serviceaccount:<namespace>:<name>/],
+        ["DNS_CONTROLLER_API_PORT", { DNS_CONTROLLER_API_PORT: "70000" }, /from 1 to 65535/],
+        ["DNS_CONTROLLER_LONG_POLL_TIMEOUT_SECONDS", { DNS_CONTROLLER_LONG_POLL_TIMEOUT_SECONDS: "5" }, /from 10 to 900/],
+        ["DNS_CONTROLLER_STATUS_INTERVAL_SECONDS", { DNS_CONTROLLER_STATUS_INTERVAL_SECONDS: "1" }, /from 5 to 3600/],
     ])("refuses a bad %s", (_name, patch, message) => {
         expect(() => loadConfig({ ...base, ...patch })).toThrow(ConfigError);
         expect(() => loadConfig({ ...base, ...patch })).toThrow(message);

@@ -12,6 +12,9 @@
 //   change is v2, under /internal/dns/v2.
 // - The handshake (`Handshake`/`HandshakeResult`) is unversioned and its shape never changes: it is what lets two
 //   mismatched versions find out that they are.
+//
+// restapi's copy also has the readers of what the controller sends (`negotiateHandshake`, `parseStatusReport`); this one
+// has the reader of what the server sends (`parseDesiredState`).
 
 /** The API version this controller speaks. */
 export const API_VERSION_V1 = "dns.rapidmx.io/v1";
@@ -50,8 +53,11 @@ export interface V1Envelope<K extends string> {
     kind: K;
 }
 
-export type DnsProviderType = "cloudflare" | "route53" | "rfc2136" | "google" | "azure";
-export type DnsRecordKind = "A" | "AAAA" | "CNAME" | "MX" | "TXT" | "SRV";
+export const DNS_PROVIDER_TYPES = ["cloudflare", "route53", "rfc2136", "google", "azure"] as const;
+export type DnsProviderType = (typeof DNS_PROVIDER_TYPES)[number];
+export const DNS_RECORD_KINDS = ["A", "AAAA", "CNAME", "MX", "TXT", "SRV"] as const;
+export type DnsRecordKind = (typeof DNS_RECORD_KINDS)[number];
+export const OPERATION_TYPES = ["test", "takeover", "restore"] as const;
 
 /** Where a provider's credentials are: a reference, never the value. */
 export interface SecretRefV1 {
@@ -91,7 +97,7 @@ export interface EndpointSetV1 {
 /** A queued operation: a credentials test, a takeover, or restoring kept values of a released set. */
 export interface OperationV1 {
     id: string;
-    type: "test" | "takeover" | "restore";
+    type: (typeof OPERATION_TYPES)[number];
     providerUid: string;
     endpointSetId?: string;
     records?: DnsRecordV1[];
@@ -141,6 +147,9 @@ export interface StatusReportV1 extends V1Envelope<"StatusReport"> {
     operations: OperationStatusV1[];
 }
 
+/** The server's answer to a status report. */
+export type StatusReportResultV1 = V1Envelope<"StatusReportResult">;
+
 // --- Validation --------------------------------------------------------------------------------------------------------
 
 export class ApiVersionError extends Error {
@@ -172,4 +181,168 @@ export function expectV1<T extends V1Envelope<string>>(payload: unknown, kind: T
         throw new ApiVersionError(`expected kind ${kind}, got ${JSON.stringify(envelope.kind)}`);
     }
     return payload as T;
+}
+
+/** A payload of the right version whose fields are not what the version says. Its message names the field, never a value. */
+export class DnsApiPayloadError extends Error {
+    constructor(message: string) {
+        super(message);
+        this.name = "DnsApiPayloadError";
+    }
+}
+
+type Fields = Record<string, unknown>;
+
+function isText(value: unknown): value is string {
+    return typeof value === "string" && value.length > 0;
+}
+
+function isCount(value: unknown): value is number {
+    return typeof value === "number" && Number.isSafeInteger(value) && value >= 0;
+}
+
+function isTextList(value: unknown): value is string[] {
+    return Array.isArray(value) && value.every(isText);
+}
+
+function isObject(value: unknown): value is Fields {
+    return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function text(entry: Fields, key: string, at: string): string {
+    const value: unknown = entry[key];
+    if (!isText(value)) {
+        throw new DnsApiPayloadError(`'${at}${key}' must be text`);
+    }
+    return value;
+}
+
+function oneOf<T extends string>(entry: Fields, key: string, at: string, allowed: readonly T[], what: string): T {
+    if (!(allowed as readonly unknown[]).includes(entry[key])) {
+        throw new DnsApiPayloadError(`'${at}${key}' is not ${what} this controller knows`);
+    }
+    return entry[key] as T;
+}
+
+/** `entry[key]` as a list of objects, each read by `read`, or a `DnsApiPayloadError` naming the field. */
+function list<T>(entry: Fields, key: string, at: string, read: (item: Fields, at: string) => T): T[] {
+    const value: unknown = entry[key];
+    if (!Array.isArray(value)) {
+        throw new DnsApiPayloadError(`'${at}${key}' must be a list`);
+    }
+    return value.map((item: unknown, index: number) => {
+        const where = `${at}${key}[${index}]`;
+        if (!isObject(item)) {
+            throw new DnsApiPayloadError(`'${where}' must be an object`);
+        }
+        return read(item, `${where}.`);
+    });
+}
+
+function readRecord(entry: Fields, at: string): DnsRecordV1 {
+    const dnsName: string = text(entry, "dnsName", at);
+    const recordType: DnsRecordKind = oneOf(entry, "recordType", at, DNS_RECORD_KINDS, "a record type");
+    if (!isTextList(entry.targets) || entry.targets.length === 0) {
+        throw new DnsApiPayloadError(`'${at}targets' must be a list of text`);
+    }
+    const record: DnsRecordV1 = { dnsName, recordType, targets: [...entry.targets] };
+    if (entry.ttl !== undefined) {
+        if (!isCount(entry.ttl)) {
+            throw new DnsApiPayloadError(`'${at}ttl' must be a whole number`);
+        }
+        record.ttl = entry.ttl;
+    }
+    return record;
+}
+
+function readSecretRef(value: unknown, at: string): SecretRefV1 {
+    if (
+        !isObject(value) ||
+        (value.backend !== "openbao" && value.backend !== "kubernetes") ||
+        !isText(value.path) ||
+        !isTextList(value.keys) ||
+        !isCount(value.generation)
+    ) {
+        throw new DnsApiPayloadError(`'${at}secretRef' must be a secret reference`);
+    }
+    return { backend: value.backend, path: value.path, keys: [...value.keys], generation: value.generation };
+}
+
+function readProvider(entry: Fields, at: string): DnsProviderV1 {
+    const uid: string = text(entry, "uid", at);
+    const type: DnsProviderType = oneOf(entry, "type", at, DNS_PROVIDER_TYPES, "a provider type");
+    if (!isTextList(entry.zones)) {
+        throw new DnsApiPayloadError(`'${at}zones' must be a list of text`);
+    }
+    if (!isObject(entry.options)) {
+        throw new DnsApiPayloadError(`'${at}options' must be an object`);
+    }
+    const options: DnsProviderV1["options"] = {};
+    for (const [key, value] of Object.entries(entry.options)) {
+        if (typeof value === "string" || typeof value === "boolean" || (typeof value === "number" && Number.isFinite(value))) {
+            options[key] = value;
+        } else if (Array.isArray(value) && value.every((v) => typeof v === "string")) {
+            options[key] = [...value];
+        } else {
+            throw new DnsApiPayloadError(`'${at}options.${key}' must be text, a number, a switch or a list of text`);
+        }
+    }
+    if (typeof entry.enabled !== "boolean") {
+        throw new DnsApiPayloadError(`'${at}enabled' must be true or false`);
+    }
+    const provider: DnsProviderV1 = { uid, type, zones: [...entry.zones], options, enabled: entry.enabled };
+    // A config without credentials (Route 53 through IRSA, unsigned rfc2136) has none; `null` means the same.
+    if (entry.secretRef !== undefined && entry.secretRef !== null) {
+        provider.secretRef = readSecretRef(entry.secretRef, at);
+    }
+    return provider;
+}
+
+function readEndpointSet(entry: Fields, at: string): EndpointSetV1 {
+    const id: string = text(entry, "id", at);
+    const providerUid: string = text(entry, "providerUid", at);
+    const domainUid: string | undefined = entry.domainUid !== undefined ? text(entry, "domainUid", at) : undefined;
+    const records: DnsRecordV1[] = list(entry, "records", at, readRecord);
+    return { id, providerUid, ...(domainUid !== undefined ? { domainUid } : {}), records };
+}
+
+function readOperation(entry: Fields, at: string): OperationV1 {
+    const operation: OperationV1 = {
+        id: text(entry, "id", at),
+        type: oneOf(entry, "type", at, OPERATION_TYPES, "an operation"),
+        providerUid: text(entry, "providerUid", at),
+    };
+    if (entry.endpointSetId !== undefined) {
+        operation.endpointSetId = text(entry, "endpointSetId", at);
+    }
+    if (entry.records !== undefined) {
+        operation.records = list(entry, "records", at, readRecord);
+    }
+    return operation;
+}
+
+/**
+ * Reads the server's `DesiredState`: the envelope (`ApiVersionError` for another version or kind, which sends the
+ * controller back to the handshake), then every field v1 defines. The result holds only those fields: unknown ones are
+ * left out, as v1's additive rule says.
+ *
+ * A malformed field refuses the **whole** state (`DnsApiPayloadError`), never just its entry: the controller publishes
+ * exactly the desired state, so an endpoint set or provider dropped from it would be deleted from the zone. A provider
+ * type, record type or operation this controller doesn't know is refused the same way, for the same reason.
+ */
+export function parseDesiredState(payload: unknown): DesiredStateV1 {
+    const state = expectV1<DesiredStateV1>(payload, "DesiredState") as unknown as Fields;
+    if (!isCount(state.version)) {
+        throw new DnsApiPayloadError("'version' must be a whole number");
+    }
+    return {
+        apiVersion: API_VERSION_V1,
+        kind: "DesiredState",
+        version: state.version,
+        ownerId: text(state, "ownerId", ""),
+        externalDnsImage: text(state, "externalDnsImage", ""),
+        providers: list(state, "providers", "", readProvider),
+        endpointSets: list(state, "endpointSets", "", readEndpointSet),
+        operations: list(state, "operations", "", readOperation),
+    };
 }

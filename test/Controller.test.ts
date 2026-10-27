@@ -179,4 +179,102 @@ describe("Controller", () => {
         expect(c.currentState).toBe("stopped");
         expect(elector.start).not.toHaveBeenCalled();
     });
+
+    describe("with the desired-state sync", () => {
+        let sync: { start: ReturnType<typeof vi.fn>; stop: ReturnType<typeof vi.fn>; health: () => Record<string, unknown> };
+        let recheck: (reason: string) => void;
+
+        beforeEach(() => {
+            sync = {
+                start: vi.fn((onIncompatible: (reason: string) => void) => (recheck = onIncompatible)),
+                stop: vi.fn(),
+                health: () => ({ desiredStateVersion: 42 }),
+            };
+        });
+
+        it("syncs while compatible, and shows the desired-state version", async () => {
+            answers = [compatible];
+            const c = controller({ sync });
+            c.start();
+            await vi.advanceTimersByTimeAsync(0);
+            expect(sync.start).toHaveBeenCalledTimes(1);
+            expect(c.health().details).toMatchObject({ state: "compatible", desiredStateVersion: 42 });
+            await c.stop();
+            expect(sync.stop).toHaveBeenCalled();
+        });
+
+        it("does not sync while incompatible", async () => {
+            answers = [incompatible];
+            const c = controller({ sync });
+            c.start();
+            await vi.advanceTimersByTimeAsync(0);
+            expect(sync.start).not.toHaveBeenCalled();
+            expect(sync.stop).toHaveBeenCalled();
+            expect(c.health().details).not.toHaveProperty("desiredStateVersion");
+        });
+
+        it("goes back to the handshake when a later call finds the versions no longer match, and stops writing meanwhile", async () => {
+            let release: (o: HandshakeOutcome) => void = () => undefined;
+            const handshake = vi.fn(async () => compatible);
+            const c = controller({ sync, server: { handshake } });
+            c.start();
+            await vi.advanceTimersByTimeAsync(0);
+            holds = true;
+            expect(c.mayWrite()).toBe(true);
+            handshake.mockImplementationOnce(() => new Promise((resolve) => (release = resolve)));
+            recheck("the server has no dns.rapidmx.io/v1 DNS API (404)");
+            expect(c.currentState).toBe("starting");
+            expect(c.mayWrite()).toBe(false);
+            expect(sync.stop).toHaveBeenCalledTimes(1);
+            expect(logged().find((e) => e.msg === "dns_api_recheck")).toMatchObject({
+                level: "warn",
+                reason: "the server has no dns.rapidmx.io/v1 DNS API (404)",
+            });
+            await vi.advanceTimersByTimeAsync(0);
+            expect(handshake).toHaveBeenCalledTimes(2);
+            // The server was rolled back: the handshake now says so, and the controller refuses to act.
+            release(incompatible);
+            await vi.advanceTimersByTimeAsync(0);
+            expect(c.currentState).toBe("incompatible");
+            expect(elector.stop).toHaveBeenCalled();
+            await c.stop();
+        });
+
+        it("resumes syncing when the handshake still matches, without asking again more than once an interval", async () => {
+            const handshake = vi.fn(async () => compatible);
+            const c = controller({ sync, server: { handshake } });
+            c.start();
+            await vi.advanceTimersByTimeAsync(0);
+            recheck("first");
+            await vi.advanceTimersByTimeAsync(0);
+            expect(handshake).toHaveBeenCalledTimes(2);
+            expect(c.currentState).toBe("compatible");
+            expect(sync.start).toHaveBeenCalledTimes(2);
+            expect(elector.start).toHaveBeenCalledTimes(2);
+            // A server that says "compatible" but has no /v1 must not make the controller spin.
+            await vi.advanceTimersByTimeAsync(10000);
+            recheck("second");
+            await vi.advanceTimersByTimeAsync(49999);
+            expect(handshake).toHaveBeenCalledTimes(2);
+            await vi.advanceTimersByTimeAsync(1);
+            expect(handshake).toHaveBeenCalledTimes(3);
+            await vi.advanceTimersByTimeAsync(60000);
+            recheck("third");
+            await vi.advanceTimersByTimeAsync(0);
+            expect(handshake).toHaveBeenCalledTimes(4);
+            await c.stop();
+        });
+
+        it("ignores a recheck once it is no longer compatible", async () => {
+            answers = [compatible];
+            const c = controller({ sync });
+            c.start();
+            await vi.advanceTimersByTimeAsync(0);
+            await c.stop();
+            recheck("late");
+            await vi.advanceTimersByTimeAsync(60000);
+            expect(c.currentState).toBe("stopped");
+            expect(handshakes).toBe(1);
+        });
+    });
 });

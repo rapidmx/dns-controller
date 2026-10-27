@@ -44,11 +44,15 @@ export class HealthServer {
         res.end(JSON.stringify(body));
     }
 
-    /** Listens on `port` (0 picks a free one) and resolves with the port in use. */
-    listen(port: number, host = "0.0.0.0"): Promise<number> {
+    /**
+     * Listens on `port` (0 picks a free one) and resolves with the port in use. Without a `host` it listens as Node does
+     * by default: on `::`, which takes IPv4 too on a dual-stack pod and is the only address of a single-stack IPv6 one,
+     * or on `0.0.0.0` where the pod has no IPv6.
+     */
+    listen(port: number, host?: string): Promise<number> {
         return new Promise((resolve, reject) => {
             this.server.once("error", reject);
-            this.server.listen(port, host, () => {
+            this.server.listen({ port, host }, () => {
                 this.server.off("error", reject);
                 resolve((this.server.address() as AddressInfo).port);
             });
