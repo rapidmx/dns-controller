@@ -9,6 +9,18 @@ any one machine's global Claude memory), so it travels with the code.
 decision, finding, or reverted approach worth remembering, add a dated entry under Session Log.
 Keep entries terse — this is a reference, not a transcript.
 
+## Agent model assignments (JP, 2026-10-28)
+
+Standing rule for every AI agent working on this project (applies to all RapidMX and RapidREST repositories):
+
+| Kind of work | Model |
+|---|---|
+| Design (specs, plans, architecture proposals) | Opus 5.5 (`claude-opus-5-5`) |
+| Architectural review | Opus 5.5 (`claude-opus-5-5`) |
+| Code review (finding and verifying defects in diffs or code) | Sonnet 5.5 (`claude-sonnet-5-5`) |
+| Fixes (implementing review findings and other code changes) | Sonnet 5.5 (`claude-sonnet-5-5`) |
+| Simple operations (file operations, renames, project initialization and similar mechanical tasks) | Haiku 5.5 (`claude-haiku-5-5`) |
+
 ## Standing decisions
 
 - **Commit discipline.** Don't `git commit` unless explicitly asked for *that specific piece of
@@ -224,15 +236,3 @@ providers/endpoints/operations entries and `PUT`/`DELETE /v1/secrets/:path`.
   validation, stop() draining before the Lease is released, removal order; the broad Secret `get` kept (above).
 - Verified: `yarn lint`, `yarn build`, `yarn test` (329 tests, 100% statements/branches/functions/lines) from D:;
   `tsc -p tsconfig.test.json` still has the 27 errors in untouched C2 test files.
-
-## Agent model assignments (JP, 2026-10-28)
-
-Standing rule for every AI agent working on this project (applies to all RapidMX and RapidREST repositories):
-
-| Kind of work | Model |
-|---|---|
-| Design (specs, plans, architecture proposals) | Opus 5.5 (`claude-opus-5-5`) |
-| Architectural review | Opus 5.5 (`claude-opus-5-5`) |
-| Code review (finding and verifying defects in diffs or code) | Sonnet 5.5 (`claude-sonnet-5-5`) |
-| Fixes (implementing review findings and other code changes) | Sonnet 5.5 (`claude-sonnet-5-5`) |
-| Simple operations (file operations, renames, project initialization and similar mechanical tasks) | Haiku 5.5 (`claude-haiku-5-5`) |
