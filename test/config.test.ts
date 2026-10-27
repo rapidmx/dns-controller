@@ -6,6 +6,8 @@ const base = {
     KUBERNETES_SERVICE_HOST: "10.43.0.1",
     HOSTNAME: "mail-dns-controller-abc",
     DNS_CONTROLLER_SERVER_SUBJECT: "system:serviceaccount:rapidmx:mail",
+    DNS_CONTROLLER_FULLNAME: "mail",
+    DNS_CONTROLLER_RELEASE: "mail",
 };
 
 describe("loadConfig", () => {
@@ -29,7 +31,41 @@ describe("loadConfig", () => {
             renewIntervalSeconds: 10,
             healthPort: 8081,
             logLevel: "info",
+            fullname: "mail",
+            release: "mail",
+            externalDnsImage: "registry.k8s.io/external-dns/external-dns:v0.23.0",
+            externalDnsServiceAccount: "mail-external-dns",
+            resyncMinutes: 10,
         });
+    });
+
+    it("reads the external-dns settings and the OpenBao SecretStore", () => {
+        const pin = "registry.k8s.io/external-dns/external-dns:v0.23.0@sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+        expect(
+            loadConfig({
+                ...base,
+                DNS_CONTROLLER_FULLNAME: " rel-rapidmx ",
+                DNS_CONTROLLER_RELEASE: "rel",
+                DNS_CONTROLLER_EXTERNAL_DNS_IMAGE: pin,
+                DNS_CONTROLLER_EXTERNAL_DNS_SERVICE_ACCOUNT: "dns-sa",
+                DNS_CONTROLLER_EXTERNAL_DNS_RESOURCES: '{"requests":{"cpu":"10m"},"limits":{"memory":"128Mi"}}',
+                DNS_CONTROLLER_RESYNC_MINUTES: "5",
+                DNS_CONTROLLER_OPENBAO_SECRET_STORE: "rel-rapidmx-openbao",
+                DNS_CONTROLLER_OPENBAO_PATH_PREFIX: "/rel-rapidmx/integrations/",
+                DNS_CONTROLLER_EXTERNAL_SECRETS_API_VERSION: "external-secrets.io/v1beta1",
+            })
+        ).toMatchObject({
+            fullname: "rel-rapidmx",
+            release: "rel",
+            externalDnsImage: pin,
+            externalDnsServiceAccount: "dns-sa",
+            externalDnsResources: { requests: { cpu: "10m" }, limits: { memory: "128Mi" } },
+            resyncMinutes: 5,
+            openbao: { secretStore: "rel-rapidmx-openbao", pathPrefix: "rel-rapidmx/integrations", externalSecretsApiVersion: "external-secrets.io/v1beta1" },
+        });
+        expect(
+            loadConfig({ ...base, DNS_CONTROLLER_OPENBAO_SECRET_STORE: "mail-openbao", DNS_CONTROLLER_OPENBAO_PATH_PREFIX: "mail/integrations" }).openbao
+        ).toEqual({ secretStore: "mail-openbao", pathPrefix: "mail/integrations", externalSecretsApiVersion: "external-secrets.io/v1" });
     });
 
     it("reads every override", () => {
@@ -104,6 +140,33 @@ describe("loadConfig", () => {
         ["DNS_CONTROLLER_API_PORT", { DNS_CONTROLLER_API_PORT: "70000" }, /from 1 to 65535/],
         ["DNS_CONTROLLER_LONG_POLL_TIMEOUT_SECONDS", { DNS_CONTROLLER_LONG_POLL_TIMEOUT_SECONDS: "5" }, /from 10 to 900/],
         ["DNS_CONTROLLER_STATUS_INTERVAL_SECONDS", { DNS_CONTROLLER_STATUS_INTERVAL_SECONDS: "1" }, /from 5 to 3600/],
+        ["DNS_CONTROLLER_FULLNAME", { DNS_CONTROLLER_FULLNAME: undefined }, /DNS_CONTROLLER_FULLNAME must be set/],
+        ["DNS_CONTROLLER_FULLNAME", { DNS_CONTROLLER_FULLNAME: "Mail_Server" }, /DNS_CONTROLLER_FULLNAME must be a Kubernetes name/],
+        ["DNS_CONTROLLER_FULLNAME", { DNS_CONTROLLER_FULLNAME: "a".repeat(64) }, /DNS_CONTROLLER_FULLNAME must be a Kubernetes name/],
+        ["DNS_CONTROLLER_RELEASE", { DNS_CONTROLLER_RELEASE: undefined }, /DNS_CONTROLLER_RELEASE must be set/],
+        ["DNS_CONTROLLER_RELEASE", { DNS_CONTROLLER_RELEASE: "rel/x" }, /DNS_CONTROLLER_RELEASE must be a label value/],
+        ["DNS_CONTROLLER_EXTERNAL_DNS_IMAGE", { DNS_CONTROLLER_EXTERNAL_DNS_IMAGE: "two words" }, /DNS_CONTROLLER_EXTERNAL_DNS_IMAGE must be an image reference/],
+        ["DNS_CONTROLLER_EXTERNAL_DNS_SERVICE_ACCOUNT", { DNS_CONTROLLER_EXTERNAL_DNS_SERVICE_ACCOUNT: "No" }, /must be a Kubernetes name/],
+        ["DNS_CONTROLLER_EXTERNAL_DNS_RESOURCES", { DNS_CONTROLLER_EXTERNAL_DNS_RESOURCES: "[1]" }, /must be a JSON object/],
+        ["DNS_CONTROLLER_EXTERNAL_DNS_RESOURCES", { DNS_CONTROLLER_EXTERNAL_DNS_RESOURCES: "{" }, /must be a JSON object/],
+        ["DNS_CONTROLLER_RESYNC_MINUTES", { DNS_CONTROLLER_RESYNC_MINUTES: "0" }, /from 1 to 1440/],
+        ["DNS_CONTROLLER_OPENBAO_SECRET_STORE", { DNS_CONTROLLER_OPENBAO_SECRET_STORE: "mail-openbao" }, /set both or neither/],
+        ["DNS_CONTROLLER_OPENBAO_PATH_PREFIX", { DNS_CONTROLLER_OPENBAO_PATH_PREFIX: "mail/integrations" }, /set both or neither/],
+        [
+            "DNS_CONTROLLER_OPENBAO_SECRET_STORE",
+            { DNS_CONTROLLER_OPENBAO_SECRET_STORE: "Bad Store", DNS_CONTROLLER_OPENBAO_PATH_PREFIX: "mail/integrations" },
+            /must be a Kubernetes name/,
+        ],
+        [
+            "DNS_CONTROLLER_OPENBAO_PATH_PREFIX",
+            { DNS_CONTROLLER_OPENBAO_SECRET_STORE: "mail-openbao", DNS_CONTROLLER_OPENBAO_PATH_PREFIX: "mail/../x" },
+            /must be a KV path/,
+        ],
+        [
+            "DNS_CONTROLLER_EXTERNAL_SECRETS_API_VERSION",
+            { DNS_CONTROLLER_OPENBAO_SECRET_STORE: "mail-openbao", DNS_CONTROLLER_OPENBAO_PATH_PREFIX: "mail/integrations", DNS_CONTROLLER_EXTERNAL_SECRETS_API_VERSION: "v2" },
+            /external-secrets.io\/v1 or external-secrets.io\/v1beta1/,
+        ],
     ])("refuses a bad %s", (_name, patch, message) => {
         expect(() => loadConfig({ ...base, ...patch })).toThrow(ConfigError);
         expect(() => loadConfig({ ...base, ...patch })).toThrow(message);

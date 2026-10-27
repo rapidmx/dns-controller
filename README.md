@@ -19,16 +19,17 @@ The design is in `@rapidmx/restapi`'s
 
 ## Status
 
-Phase C2: on top of the C1 skeleton (configuration, structured logging, health endpoints, the Kubernetes REST client,
-the Lease-based single writer, the start-up handshake), the controller reads the desired state from the server with a
-long poll, reports its status back, and authenticates the server's calls to its own internal API. It does not manage
-external-dns yet.
+Phase C3, first part: on top of C1 (configuration, structured logging, health endpoints, the Kubernetes REST client,
+the Lease-based single writer, the start-up handshake) and C2 (the desired-state long poll, status reports, authentication
+both ways), the controller reconciles the desired state into external-dns Deployments, `ExternalSecret`s and
+`DNSEndpoint`s. Its status reports don't list them yet, and the secret routes for the Kubernetes-Secret backend are still
+to come.
 
 | Phase | Scope | State |
 | --- | --- | --- |
 | C1 | Skeleton: configuration, logging, health, Kubernetes client, Lease, `v1` types and the handshake | done |
 | C2 | Desired-state long poll, status reports, projected-token authentication both ways | done |
-| C3 | Reconcile: external-dns Deployments, `DNSEndpoint`s, `ExternalSecret`s, per-provider and per-endpoint status, secret writes for the Kubernetes-Secret backend | planned |
+| C3 | Reconcile: external-dns Deployments, `DNSEndpoint`s, `ExternalSecret`s (done); per-provider and per-endpoint status, secret writes for the Kubernetes-Secret backend (planned) | in progress |
 | C4 | Takeover, credentials-test and restore Jobs | planned |
 | C5 | external-dns metrics and per-provider health | planned |
 
@@ -57,6 +58,38 @@ external-dns yet.
   subject `DNS_CONTROLLER_SERVER_SUBJECT`. Every refusal is the same 403. The internal API serves nothing while the
   controller may not write (incompatible, or not holding the Lease); its routes arrive with C3.
 
+## What it writes
+
+All in its own namespace, with server-side apply as `rapidmx-dns-controller`, only while it is compatible with the server
+and holds its Lease (checked before every write), and labelled `app.kubernetes.io/managed-by: rapidmx-dns-controller` and
+`app.kubernetes.io/instance: <release>`, which is how it finds what to delete.
+
+- **Per DNS provider config:** the Deployment `<fullname>-external-dns-<uid>`: external-dns with exactly the pinned
+  image (`DNS_CONTROLLER_EXTERNAL_DNS_IMAGE`; a desired state naming another changes no Deployment), one replica (none
+  while the config is disabled or its credentials are incomplete), `Recreate`, non-root, read-only, no capabilities,
+  reading only the `DNSEndpoint`s labelled `rapidmx.io/dns-provider: <uid>` with the TXT registry
+  (`--txt-owner-id` from the server, `--txt-prefix=rmx-%{record_type}.`, `--policy=sync`, MX, TXT and SRV managed, but
+  never MX or SRV for rfc2136), kept out of any zone another config has nested under its own (`--exclude-domains`). Its
+  credentials come only from the Secret `<fullname>-dns-<uid>`, as environment
+  variables or a mounted file, never as arguments. With OpenBao, an `ExternalSecret` of the same name has External
+  Secrets write that Secret. The pod template carries the credentials generation the Secret already holds, so new
+  credentials roll the pod once they are there.
+- **Per endpoint set** (a domain's records, a provider's share of the deployment's hosts): the `DNSEndpoint`
+  `<fullname>-<set id>`, TXT targets in the form the provider keeps them (quoted, long values in 255-byte strings, for
+  Cloudflare, Route 53 and Google; verbatim for Azure, which keeps only one value per name; unquoted for rfc2136, which
+  can't update or delete a value with a space, `;` or quote, so such a value is left out there), Cloudflare's
+  A/AAAA/CNAME unproxied.
+- **Pruning:** a `DNSEndpoint` the desired state no longer has is deleted. A deleted provider's `ExternalSecret`,
+  Secret and Deployment go two minutes after its endpoints, so its instance can remove the records it owns; the Secret
+  only when its labels say it is that provider's, and the Deployment last.
+
+A desired state with a provider config without zones, a zone in two configs, or a credentials path outside `dns/` is
+refused whole: nothing is written.
+
+It reconciles on every new desired state, when it takes the Lease, every `DNS_CONTROLLER_RESYNC_MINUTES`, and again
+(15 s, backing off to a minute) after a pass that left something undone. On shutdown it lets the pass under way finish
+its request before releasing the Lease. It reads Secrets' metadata only, never their values.
+
 ## Configuration
 
 Set by the RapidMX server's Helm chart; listed here for reference and local runs.
@@ -73,6 +106,15 @@ Set by the RapidMX server's Helm chart; listed here for reference and local runs
 | `DNS_CONTROLLER_API_AUDIENCE` | The audience the server's token must carry (default `rapidmx-dns-controller`) |
 | `DNS_CONTROLLER_API_PORT` | Port of the internal API the server calls (default `8080`) |
 | `DNS_CONTROLLER_LEASE_NAME` | **Required.** The Lease that makes this the single writer (`<release>-dns-controller`) |
+| `DNS_CONTROLLER_FULLNAME` | **Required.** The server release's full name, which names every object the controller writes |
+| `DNS_CONTROLLER_RELEASE` | **Required.** The Helm release, the `app.kubernetes.io/instance` label of those objects |
+| `DNS_CONTROLLER_EXTERNAL_DNS_IMAGE` | The only external-dns image it runs (default `registry.k8s.io/external-dns/external-dns:v0.23.0`; the chart pins it by digest). The desired state's image must be this reference, or its tag when this one adds a digest |
+| `DNS_CONTROLLER_EXTERNAL_DNS_SERVICE_ACCOUNT` | The ServiceAccount external-dns runs as (default `<fullname>-external-dns`) |
+| `DNS_CONTROLLER_EXTERNAL_DNS_RESOURCES` | The external-dns container's `resources`, as JSON (default none) |
+| `DNS_CONTROLLER_RESYNC_MINUTES` | How often the whole desired state is reconciled again (default `10`) |
+| `DNS_CONTROLLER_OPENBAO_SECRET_STORE` | With OpenBao: the release's `SecretStore` (`<fullname>-openbao`); set with the next one or not at all |
+| `DNS_CONTROLLER_OPENBAO_PATH_PREFIX` | With OpenBao: the integrations prefix in the KV mount (`<fullname>/integrations`) |
+| `DNS_CONTROLLER_EXTERNAL_SECRETS_API_VERSION` | `external-secrets.io/v1` (default) or `external-secrets.io/v1beta1` |
 | `DNS_CONTROLLER_LEASE_DURATION_SECONDS` | Lease duration (default `30`) |
 | `DNS_CONTROLLER_LEASE_RENEW_SECONDS` | Renew interval (default `10`; at most a third of the duration) |
 | `DNS_CONTROLLER_HEALTH_PORT` | Port of `/healthz` and `/readyz` (default `8081`) |

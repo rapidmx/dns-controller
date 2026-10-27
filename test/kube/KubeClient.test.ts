@@ -108,6 +108,13 @@ describe("KubeClient", () => {
         expect(requests[1].url.search).toBe("?fieldManager=rapidmx-dns-controller&force=true");
     });
 
+    it("reads an object's metadata alone, so a Secret's values never reach the controller", async () => {
+        answer = { status: 200, body: '{"kind":"PartialObjectMetadata","metadata":{"name":"s"}}' };
+        expect(await client().getMetadata("/api/v1/namespaces/rapidmx/secrets/s")).toEqual({ kind: "PartialObjectMetadata", metadata: { name: "s" } });
+        expect(requests[0].method).toBe("GET");
+        expect(requests[0].headers.Accept).toBe("application/json;as=PartialObjectMetadata;g=meta.k8s.io;v=v1");
+    });
+
     it("returns undefined for an empty success body", async () => {
         answer = { status: 200, body: "" };
         expect(await client().delete("/apis/x/y")).toBeUndefined();

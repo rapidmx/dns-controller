@@ -14,6 +14,7 @@ import { InternalApiServer } from "./InternalApiServer.js";
 import { KubeClient, type KubeTransport } from "./kube/KubeClient.js";
 import { LeaseElector } from "./kube/LeaseElector.js";
 import { Logger, stdoutSink, type LogSink } from "./log.js";
+import { Reconciler } from "./reconcile/Reconciler.js";
 import { readControllerVersion } from "./version.js";
 
 export interface Overrides {
@@ -31,6 +32,7 @@ export interface Running {
     controller: Controller;
     elector: LeaseElector;
     sync: DesiredStateSync;
+    reconciler: Reconciler;
     healthPort: number;
     apiPort: number;
     log: Logger;
@@ -58,6 +60,8 @@ export async function startController(env: NodeJS.ProcessEnv = process.env, over
         leaseDurationSeconds: config.leaseDurationSeconds,
         renewIntervalSeconds: config.renewIntervalSeconds,
         log,
+        // Holding the Lease is what lets the reconciler write: reconcile at once rather than at its next retry.
+        onAcquired: () => reconciler.wake(),
     });
     const server = new ServerClient({
         baseUrl: config.serverUrl,
@@ -74,6 +78,8 @@ export async function startController(env: NodeJS.ProcessEnv = process.env, over
         controllerVersion: version,
         identity: config.holderIdentity,
         statusIntervalSeconds: config.statusIntervalSeconds,
+        // The reconciler is created below, with the controller it asks before every write; nothing calls these before start().
+        onDesiredState: (state) => reconciler.update(state),
     });
     const controller = new Controller({
         server,
@@ -82,6 +88,22 @@ export async function startController(env: NodeJS.ProcessEnv = process.env, over
         log,
         controllerVersion: version,
         handshakeRetrySeconds: config.handshakeRetrySeconds,
+    });
+    const reconciler = new Reconciler({
+        kube,
+        settings: {
+            namespace,
+            fullname: config.fullname,
+            release: config.release,
+            externalDnsImage: config.externalDnsImage,
+            externalDnsServiceAccount: config.externalDnsServiceAccount,
+            externalDnsResources: config.externalDnsResources,
+            openbao: config.openbao,
+        },
+        // Writes only while compatible and holding the Lease, asked before every write.
+        gate: controller,
+        log,
+        resyncMs: config.resyncMinutes * 60000,
     });
     const health = new HealthServer(() => controller.health());
     const healthPort: number = await health.listen(overrides.healthPort ?? config.healthPort);
@@ -101,10 +123,13 @@ export async function startController(env: NodeJS.ProcessEnv = process.env, over
         controller,
         elector,
         sync,
+        reconciler,
         healthPort,
         apiPort,
         log,
         async stop(): Promise<void> {
+            // The pass under way ends, its requests answered, before the Lease is released.
+            await reconciler.stop();
             await controller.stop();
             await api.close();
             await health.close();

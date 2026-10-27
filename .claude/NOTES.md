@@ -166,3 +166,61 @@ is the reference. The secret routes moved from C2 to C3 (next to the other Kuber
 - The shared fixtures in `test/fixtures/api/v1/` were not changed (still byte-identical to restapi's).
   The spec edits for C2 first went out inside restapi c8da9da (a meet-plugin commit); the dates and the
   review fixes were corrected in a later restapi commit naming the C2 spec update.
+
+### Phase C3, first part - external-dns Deployments, ExternalSecrets, DNSEndpoints
+
+Spec 7.4 "As implemented in dns-controller C3" is the reference. Still to come in C3: the status report's
+providers/endpoints/operations entries and `PUT`/`DELETE /v1/secrets/:path`.
+
+- `src/reconcile/manifests.ts` (pure builders) and `src/reconcile/Reconciler.ts` (apply, prune, schedule). The
+  external-dns flags were checked against v0.23.0's `pkg/apis/externaldns/types.go`; Cloudflare's property really is
+  `cloudflare/proxied` (`annotations.CloudflareProxiedProperty`), and Azure's tenant has no flag (only `azure.json`).
+- `quoteTxtTarget()` splits values over 255 bytes into `"..." "..."` (DKIM keys); not proven on Cloudflare by the
+  spike (short values only): the e2e's DKIM rotation checks it. Don't drop the split: Route 53 needs it.
+- **TXT form is per provider (`txtTargets()`), checked in v0.23.0's providers:** quoted for Cloudflare/Route 53/Google.
+  Azure writes and reads `Targets[0]` verbatim (`provider/azure/azure.go`), so its value goes unquoted and unsplit, and a
+  TXT name with several values is left out. rfc2136 writes zone-file text but reads back bare character-strings and
+  removes an old value by parsing what it read (`RemoveRecord`: `;` starts a comment, spaces split strings), so a value
+  with a space, `;`, quote, `\`, `(`, `)`, `$`, `@`, non-ASCII or over 255 bytes could never be updated or deleted: it
+  is left out (like MX/SRV), and plain values go unquoted so they read back equal (`Targets.Same` is `EqualFold`). So on
+  rfc2136 only the ownership-verification TXT is published; SPF/DKIM/DMARC need the server to show them manual.
+- **Shared owner id + overlapping zones:** every instance has the same `--txt-owner-id` and `--policy=sync`, so two
+  instances seeing one zone delete each other's records. A zone of another config nested under one of this config's
+  zones goes in `--exclude-domains` (`nestedZones()`; `DomainFilter.Match` applies the exclusion to zones and plan
+  records alike); the same zone in two configs (enabled or not: a disabled config's records would be deleted by the
+  other) refuses the whole state. Per-instance owner ids were the alternative: they change restapi's conflict detection
+  and C4's ownership records, so not without JP.
+- `unpublishable()` also refuses a provider without zones (no `--domain-filter` = every zone the token reaches), a zone
+  that isn't a lowercase name of two or more labels, and a `secretRef` whose path isn't `dns/<segments>` or whose keys
+  aren't `[A-Za-z0-9_-]` (the path goes into the ExternalSecret's `remoteRef.key`).
+- `Reconciler.stop()` resolves when the pass under way ends and `write()` refuses once stopping; `index.ts` awaits it
+  before `controller.stop()` releases the Lease, so no request lands after a successor took it.
+- Every write goes through `write()`, which asks the gate (`Controller.mayWrite()`) right before the call; a lost gate
+  ends the pass (`not_writer`). Per-object failures go through one `attempt()` helper: logged, pass `incomplete`, retried
+  15 s doubling to 60 s. The Lease's `onAcquired` wakes the reconciler.
+- The pod-template annotation is the generation the **Secret** holds (read via `getMetadata()`, `PartialObjectMetadata`,
+  so no values reach the controller), not the desired one: rolling before External Secrets refreshed would start the
+  pod with old credentials. The Role therefore needs `get` on secrets without `resourceNames` (spec 7.6).
+- Deleted providers: the ExternalSecret, Secret, then Deployment go 2 min after their endpoints (in-memory clock; a
+  restart waits again), never while an endpoint delete or any list failed; the Secret only with our managed-by,
+  `secret-kind: dns` and provider labels. The Deployment goes **last**: with the Kubernetes backend it is the only mark of
+  a deleted provider (nothing lists Secrets). Residual: a Kubernetes-backend Secret whose Deployment was deleted by hand
+  (or never created) is not found; the coming secret write could give it an ownerReference.
+- Kept on review: `get`/`delete` on Secrets without `resourceNames`. The per-provider names aren't fixed, the spec's own
+  7.6 already has the Kubernetes-backend secret write check labels before changing one (which needs `get`), and the
+  Role's create-Deployment/Job rights already let it read any namespace Secret by mounting it. Only names built from a
+  validated uid are ever read.
+- Image pin: the Deployment always runs `DNS_CONTROLLER_EXTERNAL_DNS_IMAGE`; the desired image must equal it or its tag
+  (the server's default has no digest). Another image changes no Deployment.
+- For server step 8 (chart): the new env vars (`DNS_CONTROLLER_FULLNAME`, `_RELEASE` required; OpenBao store and
+  prefix together), and the Kubernetes-backend secret write must produce Azure's `azure.json` (the ESO template does it
+  for OpenBao).
+- Spec edits (4.2 TXT splitting and per-provider form, 7.2 C3 status, 7.4/7.5/7.6 "as implemented") went out alone in
+  restapi 68444dd, leaving another track's uncommitted move of the auth-server paragraph unstaged.
+- Restapi follow-ups this asks for: refuse a zone already in another config (409); assign a domain only to the most
+  specific covering config; mark rfc2136's non-plain TXT values and Azure's multi-value TXT names manual
+  (`kind_unsupported`); refuse or limit the apex TXT opt-in on Azure.
+- Review resolved (7 findings): per-provider TXT form, nested-zone exclusion and same-zone refusal, zone/path/key
+  validation, stop() draining before the Lease is released, removal order; the broad Secret `get` kept (above).
+- Verified: `yarn lint`, `yarn build`, `yarn test` (329 tests, 100% statements/branches/functions/lines) from D:;
+  `tsc -p tsconfig.test.json` still has the 27 errors in untouched C2 test files.

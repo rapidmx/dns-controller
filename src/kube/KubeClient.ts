@@ -158,11 +158,19 @@ export class KubeClient {
         return this.request<T>("DELETE", path);
     }
 
-    private async request<T>(method: KubeMethod, path: string, body?: string, contentType?: string): Promise<T> {
+    /**
+     * An object's metadata alone (`PartialObjectMetadata`): its labels and annotations without its contents, so reading a
+     * Secret's labels never brings its values into this process.
+     */
+    getMetadata<T>(path: string): Promise<T> {
+        return this.request<T>("GET", path, undefined, undefined, "application/json;as=PartialObjectMetadata;g=meta.k8s.io;v=v1");
+    }
+
+    private async request<T>(method: KubeMethod, path: string, body?: string, contentType?: string, accept = "application/json"): Promise<T> {
         const host: string = this.options.host.includes(":") ? `[${this.options.host}]` : this.options.host;
         const url = new URL(`https://${host}:${this.options.port}${path}`);
         const headers: Record<string, string> = {
-            Accept: "application/json",
+            Accept: accept,
             Authorization: `Bearer ${await this.token()}`,
         };
         if (contentType) {

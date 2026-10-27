@@ -43,7 +43,33 @@ export interface ControllerConfig {
     /** Port of `/healthz` and `/readyz`. */
     healthPort: number;
     logLevel: LogLevel;
+    /** The server release's full name, which names every object the controller writes (`<fullname>-external-dns-<uid>`, ...). */
+    fullname: string;
+    /** The Helm release: the `app.kubernetes.io/instance` label of those objects, which selects what this controller manages. */
+    release: string;
+    /** The one external-dns image the controller runs (`dns.externalDns.image`, by digest), whatever the desired state names. */
+    externalDnsImage: string;
+    /** The ServiceAccount every external-dns instance runs as (`<fullname>-external-dns`, created by the chart). */
+    externalDnsServiceAccount: string;
+    /** The external-dns container's `resources` (`dns.externalDns.resources`); none when unset. */
+    externalDnsResources?: Record<string, unknown>;
+    /** How often the whole desired state is reconciled again while nothing changes. */
+    resyncMinutes: number;
+    /** Where External Secrets reads DNS credentials kept in OpenBao; unset when the deployment has no OpenBao. */
+    openbao?: OpenbaoSettings;
 }
+
+export interface OpenbaoSettings {
+    /** The release's `SecretStore` (`<fullname>-openbao`). */
+    secretStore: string;
+    /** The integrations prefix inside the KV mount (`<fullname>/integrations`), which a `SecretRef` path is under. */
+    pathPrefix: string;
+    /** `external-secrets.io/v1`, or `v1beta1` on an older External Secrets. */
+    externalSecretsApiVersion: string;
+}
+
+/** The external-dns release the controller is built and tested against (spec 7.4). */
+export const DEFAULT_EXTERNAL_DNS_IMAGE = "registry.k8s.io/external-dns/external-dns:v0.23.0";
 
 export class ConfigError extends Error {
     constructor(message: string) {
@@ -99,6 +125,64 @@ function serviceAccountSubject(name: string, raw: string): string {
     return raw;
 }
 
+/** A Kubernetes object name that is also a DNS label: what every name derived from it must stay. */
+function kubernetesName(name: string, raw: string): string {
+    if (!/^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$/.test(raw)) {
+        throw new ConfigError(`${name} must be a Kubernetes name: lowercase letters, digits and '-', at most 63 (got '${raw}').`);
+    }
+    return raw;
+}
+
+function labelValue(name: string, raw: string): string {
+    if (!/^[A-Za-z0-9]([A-Za-z0-9._-]{0,61}[A-Za-z0-9])?$/.test(raw)) {
+        throw new ConfigError(`${name} must be a label value: letters, digits, '-', '_' and '.', at most 63 (got '${raw}').`);
+    }
+    return raw;
+}
+
+function jsonObject(env: NodeJS.ProcessEnv, name: string): Record<string, unknown> | undefined {
+    const raw: string | undefined = env[name]?.trim();
+    if (!raw) {
+        return undefined;
+    }
+    let value: unknown;
+    try {
+        value = JSON.parse(raw);
+    } catch {
+        value = undefined;
+    }
+    if (typeof value !== "object" || value === null || Array.isArray(value)) {
+        throw new ConfigError(`${name} must be a JSON object.`);
+    }
+    return value as Record<string, unknown>;
+}
+
+/** The SecretStore and KV prefix External Secrets reads DNS credentials through: both, or neither (no OpenBao). */
+function openbaoSettings(env: NodeJS.ProcessEnv): OpenbaoSettings | undefined {
+    const store: string | undefined = env.DNS_CONTROLLER_OPENBAO_SECRET_STORE?.trim();
+    const prefix: string | undefined = env.DNS_CONTROLLER_OPENBAO_PATH_PREFIX?.trim().replace(/^\/+|\/+$/g, "");
+    if (!store && !prefix) {
+        return undefined;
+    }
+    if (!store || !prefix) {
+        throw new ConfigError("DNS_CONTROLLER_OPENBAO_SECRET_STORE and DNS_CONTROLLER_OPENBAO_PATH_PREFIX: set both or neither.");
+    }
+    if (!/^[A-Za-z0-9_-]+(\/[A-Za-z0-9_-]+)*$/.test(prefix)) {
+        throw new ConfigError(`DNS_CONTROLLER_OPENBAO_PATH_PREFIX must be a KV path: segments of letters, digits, '-' and '_' (got '${prefix}').`);
+    }
+    const apiVersion: string = optional(env, "DNS_CONTROLLER_EXTERNAL_SECRETS_API_VERSION", "external-secrets.io/v1");
+    if (apiVersion !== "external-secrets.io/v1" && apiVersion !== "external-secrets.io/v1beta1") {
+        throw new ConfigError(
+            `DNS_CONTROLLER_EXTERNAL_SECRETS_API_VERSION must be external-secrets.io/v1 or external-secrets.io/v1beta1 (got '${apiVersion}').`
+        );
+    }
+    return {
+        secretStore: kubernetesName("DNS_CONTROLLER_OPENBAO_SECRET_STORE", store),
+        pathPrefix: prefix,
+        externalSecretsApiVersion: apiVersion,
+    };
+}
+
 /** Reads and validates the configuration. Throws `ConfigError` naming the first bad variable. */
 export function loadConfig(env: NodeJS.ProcessEnv = process.env): ControllerConfig {
     const serverUrl: string = httpUrl("DNS_CONTROLLER_SERVER_URL", required(env, "DNS_CONTROLLER_SERVER_URL"));
@@ -115,6 +199,13 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): ControllerConf
     if (!(LOG_LEVELS as readonly string[]).includes(level)) {
         throw new ConfigError(`DNS_CONTROLLER_LOG_LEVEL must be one of ${LOG_LEVELS.join(", ")} (got '${level}').`);
     }
+    const fullname: string = kubernetesName("DNS_CONTROLLER_FULLNAME", required(env, "DNS_CONTROLLER_FULLNAME"));
+    const externalDnsImage: string = optional(env, "DNS_CONTROLLER_EXTERNAL_DNS_IMAGE", DEFAULT_EXTERNAL_DNS_IMAGE);
+    if (/\s/.test(externalDnsImage)) {
+        throw new ConfigError(`DNS_CONTROLLER_EXTERNAL_DNS_IMAGE must be an image reference (got '${externalDnsImage}').`);
+    }
+    const externalDnsResources: Record<string, unknown> | undefined = jsonObject(env, "DNS_CONTROLLER_EXTERNAL_DNS_RESOURCES");
+    const openbao: OpenbaoSettings | undefined = openbaoSettings(env);
     return {
         serverUrl,
         serverTokenFile: optional(env, "DNS_CONTROLLER_SERVER_TOKEN_FILE", DEFAULT_SERVER_TOKEN_FILE),
@@ -134,5 +225,15 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): ControllerConf
         renewIntervalSeconds,
         healthPort: integer(env, "DNS_CONTROLLER_HEALTH_PORT", 8081, 1, 65535),
         logLevel: level as LogLevel,
+        fullname,
+        release: labelValue("DNS_CONTROLLER_RELEASE", required(env, "DNS_CONTROLLER_RELEASE")),
+        externalDnsImage,
+        externalDnsServiceAccount: kubernetesName(
+            "DNS_CONTROLLER_EXTERNAL_DNS_SERVICE_ACCOUNT",
+            optional(env, "DNS_CONTROLLER_EXTERNAL_DNS_SERVICE_ACCOUNT", `${fullname}-external-dns`)
+        ),
+        ...(externalDnsResources ? { externalDnsResources } : {}),
+        resyncMinutes: integer(env, "DNS_CONTROLLER_RESYNC_MINUTES", 10, 1, 1440),
+        ...(openbao ? { openbao } : {}),
     };
 }

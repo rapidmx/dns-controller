@@ -25,8 +25,8 @@ export interface ControllerOptions {
 }
 
 /**
- * The controller's top level: the compatibility handshake, then the Lease and the desired-state sync. Reconciling
- * desired state into Kubernetes objects (phase C3) starts only when both hold.
+ * The controller's top level: the compatibility handshake, then the Lease and the desired-state sync. The reconciler
+ * writes the desired state into Kubernetes only while `mayWrite()`: compatible and holding the Lease.
  *
  * - **Compatible:** the Lease elector and the desired-state sync start; nothing is written without holding the Lease.
  * - **Incompatible:** the controller refuses to act. It does not take (and releases) the Lease, stops the sync, writes

@@ -51,6 +51,10 @@ describe("startController / runMain", () => {
             KUBERNETES_SERVICE_HOST: "10.43.0.1",
             POD_NAME: "mail-dns-controller-abc",
             DNS_CONTROLLER_SERVER_SUBJECT: "system:serviceaccount:rapidmx:mail",
+            DNS_CONTROLLER_FULLNAME: "mail",
+            DNS_CONTROLLER_RELEASE: "mail",
+            DNS_CONTROLLER_OPENBAO_SECRET_STORE: "mail-openbao",
+            DNS_CONTROLLER_OPENBAO_PATH_PREFIX: "mail/integrations",
         };
         fetchCalls = [];
         kubeRequests = [];
@@ -84,11 +88,19 @@ describe("startController / runMain", () => {
             expect(running.healthPort).toBeGreaterThan(0);
             await waitFor(() => running.elector.holds());
             expect(running.controller.mayWrite()).toBe(true);
-            expect(kubeRequests.map((r) => `${r.method} ${r.url.pathname}`)).toEqual([
+            expect(kubeRequests.slice(0, 2).map((r) => `${r.method} ${r.url.pathname}`)).toEqual([
                 "GET /apis/coordination.k8s.io/v1/namespaces/rapidmx/leases/mail-dns-controller",
                 "POST /apis/coordination.k8s.io/v1/namespaces/rapidmx/leases",
             ]);
             await waitFor(() => fetchCalls.some(([url]) => url.endsWith("/v1/desired-state?since=42")));
+            // The desired state is reconciled into the namespace: the provider's instance and the domain's DNSEndpoint.
+            await waitFor(() => kubeRequests.some((r) => r.method === "PATCH" && r.url.pathname.endsWith("/dnsendpoints/mail-domain-example-com")));
+            const applied = kubeRequests.filter((r) => r.method === "PATCH").map((r) => r.url.pathname);
+            expect(applied).toEqual([
+                "/apis/external-secrets.io/v1/namespaces/rapidmx/externalsecrets/mail-dns-cloudflare-main",
+                "/apis/apps/v1/namespaces/rapidmx/deployments/mail-external-dns-cloudflare-main",
+                "/apis/externaldns.k8s.io/v1alpha1/namespaces/rapidmx/dnsendpoints/mail-domain-example-com",
+            ]);
             const urls = fetchCalls.map(([url]) => url);
             expect(urls.slice(0, 2)).toEqual(["http://mail:3000/internal/dns/handshake", "http://mail:3000/internal/dns/v1/desired-state"]);
             expect(urls).toContain("http://mail:3000/internal/dns/v1/status");
