@@ -9,7 +9,7 @@
             "uid": "cloudflare-main",
             "type": "cloudflare",
             "zones": ["example.com"],
-            "options": { "zoneIds": "0123456789abcdef0123456789abcdef" },
+            "options": { "zoneIds": ["0123456789abcdef0123456789abcdef"] },
             "secretRef": { "backend": "openbao", "path": "dns/cloudflare-main", "keys": ["apiToken"], "generation": 1 },
             "enabled": true
         }

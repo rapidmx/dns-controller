@@ -123,3 +123,12 @@ LICENSE MPL-2.0, CONTRIBUTING) and ses-bridge/activesync's Build + Publish workf
   functions/lines), `docker build`, and a smoke run of the image with `--read-only --cap-drop ALL`
   (starts as `nonroot`, `/healthz` 200, `/readyz` 200 "unavailable" with no server, exits 1 with
   `start_failed` on a missing configuration, releases cleanly on SIGTERM).
+
+### 2026-10-27 - List-valued provider options (lock-step with restapi DNS step 3)
+
+`DnsProviderV1.options` values may be `string[]` (Cloudflare's `zoneIds`, rfc2136's `hosts`): the
+server always sends `zoneIds` as a list. The shared desired-state fixture now has `zoneIds` as a list,
+changed byte-identically in restapi's `test/fixtures/dns-api/v1/` (check with `cmp`). Still to adopt
+with C3: the `StatusReportResult` kind the server answers `PUT /v1/status` with; any desired-state
+version other than the controller's own is a change (the server answers a `since` ahead of its
+counter at once, after a Redis reset); only the Lease holder's status report changes server rows.

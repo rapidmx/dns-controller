@@ -26,6 +26,8 @@ describe("API v1", () => {
         const state = expectV1<DesiredStateV1>(fixture("desired-state"), "DesiredState");
         expect(state.version).toBe(42);
         expect(state.endpointSets[0].records.map((r) => r.dnsName)).toContain("_rapidmx-verify.example.com");
+        // An option value may be a list.
+        expect(state.providers[0].options.zoneIds).toEqual(["0123456789abcdef0123456789abcdef"]);
     });
 
     it("accepts the status-report fixture", () => {

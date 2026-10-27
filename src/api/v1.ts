@@ -65,7 +65,8 @@ export interface DnsProviderV1 {
     uid: string;
     type: DnsProviderType;
     zones: string[];
-    options: Record<string, string | number | boolean>;
+    /** Non-secret, type-specific options. A value may be a list (Cloudflare's `zoneIds`, rfc2136's `hosts`). */
+    options: Record<string, string | number | boolean | string[]>;
     secretRef?: SecretRefV1;
     enabled: boolean;
 }
