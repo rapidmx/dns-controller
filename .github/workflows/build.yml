@@ -52,6 +52,10 @@ jobs:
           restore-keys: |
             ${{ runner.os }}-yarn-
 
+      # The Coveralls action downloads its reporter with curl, which the slim image lacks.
+      - name: Install system dependencies
+        run: apt-get update && apt-get install -y --no-install-recommends ca-certificates curl
+
       - name: Install dependencies
         run: yarn install --immutable
 
