@@ -3,11 +3,11 @@ import { parseDesiredState, type DesiredStateV1, type DnsProviderV1, type Endpoi
 import {
     acceptsExternalDnsImage,
     credentialsProblem,
+    credentialsSecret,
     dnsEndpoint,
     dnsEndpointName,
     externalDnsArgs,
     externalDnsDeployment,
-    externalSecret,
     managedRecordKinds,
     nestedZones,
     ownershipEndpoint,
@@ -24,11 +24,6 @@ const settings: ManifestSettings = {
     release: "mail",
     externalDnsImage: PIN,
     externalDnsServiceAccount: "mail-external-dns",
-};
-
-const withOpenbao: ManifestSettings = {
-    ...settings,
-    openbao: { secretStore: "mail-openbao", pathPrefix: "mail/integrations", externalSecretsApiVersion: "external-secrets.io/v1" },
 };
 
 /** The shared contract fixture: what the server really sends. */
@@ -264,7 +259,7 @@ describe("credentialsProblem", () => {
         expect(credentialsProblem(provider({}))).toBe("missing credentials: apiToken");
         expect(credentialsProblem(provider({ type: "google" }))).toBe("missing credentials: serviceAccountJson");
         expect(
-            credentialsProblem(provider({ type: "azure", secretRef: { backend: "kubernetes", path: "dns/p1", keys: ["clientId"], generation: 1 } }))
+            credentialsProblem(provider({ type: "azure", credentials: { keys: ["clientId"], generation: 1 } }))
         ).toBe("missing credentials: clientSecret");
         expect(credentialsProblem(provider({ type: "rfc2136", options: { insecure: false } }))).toBe("missing credentials: tsigSecret");
     });
@@ -362,8 +357,8 @@ describe("externalDnsDeployment", () => {
     });
 
     it("gives Route 53 its region and, only when both are saved, its access keys", () => {
-        const keys = { backend: "kubernetes" as const, path: "dns/p1", keys: ["accessKeyId", "secretAccessKey"], generation: 2 };
-        const withKeys = container(externalDnsDeployment(provider({ type: "route53", options: { region: "eu-west-1" }, secretRef: keys }), OWNER, settings, 2));
+        const keys = { keys: ["accessKeyId", "secretAccessKey"], generation: 2 };
+        const withKeys = container(externalDnsDeployment(provider({ type: "route53", options: { region: "eu-west-1" }, credentials: keys }), OWNER, settings, 2));
         expect(withKeys.env).toEqual([
             { name: "AWS_REGION", value: "eu-west-1" },
             { name: "AWS_ACCESS_KEY_ID", valueFrom: { secretKeyRef: { name: "mail-dns-p1", key: "accessKeyId" } } },
@@ -374,15 +369,15 @@ describe("externalDnsDeployment", () => {
     });
 
     it("gives rfc2136 its TSIG secret through EXTERNAL_DNS_RFC2136_TSIG_SECRET, never as an argument", () => {
-        const ref = { backend: "openbao" as const, path: "dns/p1", keys: ["tsigSecret"], generation: 1 };
-        const c = container(externalDnsDeployment(provider({ type: "rfc2136", options: { hosts: ["ns1"], zone: "example.com" }, secretRef: ref }), OWNER, settings, 1));
+        const ref = { keys: ["tsigSecret"], generation: 1 };
+        const c = container(externalDnsDeployment(provider({ type: "rfc2136", options: { hosts: ["ns1"], zone: "example.com" }, credentials: ref }), OWNER, settings, 1));
         expect(c.env).toEqual([{ name: "EXTERNAL_DNS_RFC2136_TSIG_SECRET", valueFrom: { secretKeyRef: { name: "mail-dns-p1", key: "tsigSecret" } } }]);
         expect(c.args.some((a) => a.startsWith("--rfc2136-tsig-secret="))).toBe(false);
     });
 
     it("mounts Google's key file and Azure's azure.json from the Secret, read-only", () => {
         const google = externalDnsDeployment(
-            provider({ type: "google", options: { project: "x" }, secretRef: { backend: "kubernetes", path: "dns/p1", keys: ["serviceAccountJson"], generation: 1 } }),
+            provider({ type: "google", options: { project: "x" }, credentials: { keys: ["serviceAccountJson"], generation: 1 } }),
             OWNER,
             settings,
             1
@@ -393,7 +388,7 @@ describe("externalDnsDeployment", () => {
             { name: "credentials", secret: { secretName: "mail-dns-p1", items: [{ key: "serviceAccountJson", path: "credentials.json" }] } },
         ]);
         const azure = externalDnsDeployment(
-            provider({ type: "azure", options: {}, secretRef: { backend: "openbao", path: "dns/p1", keys: ["clientId", "clientSecret"], generation: 1 } }),
+            provider({ type: "azure", options: {}, credentials: { keys: ["clientId", "clientSecret"], generation: 1 } }),
             OWNER,
             settings,
             1
@@ -406,11 +401,16 @@ describe("externalDnsDeployment", () => {
     });
 });
 
-describe("externalSecret", () => {
-    it("has External Secrets materialize the provider's Secret from its OpenBao path, labelled, with the generation", () => {
-        expect(externalSecret(cloudflare, withOpenbao)).toEqual({
-            apiVersion: "external-secrets.io/v1",
-            kind: "ExternalSecret",
+describe("credentialsSecret", () => {
+    const OWNER_UID = "11111111-aaaa-bbbb-cccc-222222222222";
+    const GUID = "11111111-2222-3333-4444-555555555555";
+    const b64 = (value: string): string => Buffer.from(value, "utf8").toString("base64");
+
+    it("is the provider's Secret: labelled, at the generation it holds, owned by the instance's Deployment, with the fields as data", () => {
+        expect(credentialsSecret(cloudflare, { apiToken: "cf-token" }, settings, OWNER_UID)).toEqual({
+            apiVersion: "v1",
+            kind: "Secret",
+            type: "Opaque",
             metadata: {
                 name: "mail-dns-cloudflare-main",
                 namespace: "rapidmx",
@@ -421,55 +421,60 @@ describe("externalSecret", () => {
                     "rapidmx.io/secret-kind": "dns",
                 },
                 annotations: { "rapidmx.io/credentials-generation": "1" },
+                ownerReferences: [{ apiVersion: "apps/v1", kind: "Deployment", name: "mail-external-dns-cloudflare-main", uid: OWNER_UID }],
             },
-            spec: {
-                refreshInterval: "1h",
-                secretStoreRef: { name: "mail-openbao", kind: "SecretStore" },
-                target: {
-                    name: "mail-dns-cloudflare-main",
-                    creationPolicy: "Owner",
-                    template: {
-                        metadata: {
-                            labels: {
-                                "app.kubernetes.io/instance": "mail",
-                                "app.kubernetes.io/managed-by": "rapidmx-dns-controller",
-                                "rapidmx.io/dns-provider": "cloudflare-main",
-                                "rapidmx.io/secret-kind": "dns",
-                            },
-                            annotations: { "rapidmx.io/credentials-generation": "1" },
-                        },
-                    },
-                },
-                data: [{ secretKey: "apiToken", remoteRef: { key: "mail/integrations/dns/cloudflare-main", property: "apiToken" } }],
-            },
+            data: { apiToken: b64("cf-token") },
         });
     });
 
-    it("builds Azure's azure.json in the template, the tenant from the options and the client from the vault", () => {
-        const azure = provider({
-            type: "azure",
-            options: { tenantId: "11111111-2222-3333-4444-555555555555" },
-            secretRef: { backend: "openbao", path: "dns/p1", keys: ["clientId", "clientSecret"], generation: 3 },
+    it("holds the generation of the credentials it is given", () => {
+        const secret = credentialsSecret({ ...cloudflare, credentials: { keys: ["apiToken"], generation: 9 } }, { apiToken: "x" }, settings, OWNER_UID);
+        expect(secret.metadata.annotations).toEqual({ "rapidmx.io/credentials-generation": "9" });
+    });
+
+    it("keeps each type's own fields, in the form external-dns reads them, and leaves any other out", () => {
+        const data = (type: DnsProviderV1["type"], values: Record<string, string>): unknown =>
+            credentialsSecret(provider({ type, options: { tenantId: GUID }, credentials: { keys: Object.keys(values), generation: 1 } }), values, settings, OWNER_UID).data;
+        expect(data("cloudflare", { apiToken: "t", other: "o" })).toEqual({ apiToken: b64("t") });
+        expect(data("route53", { accessKeyId: "id", secretAccessKey: "key" })).toEqual({ accessKeyId: b64("id"), secretAccessKey: b64("key") });
+        // A field the type reads that was not sent is not invented.
+        expect(data("route53", { accessKeyId: "id" })).toEqual({ accessKeyId: b64("id") });
+        expect(data("rfc2136", { tsigSecret: "c2VjcmV0" })).toEqual({ tsigSecret: b64("c2VjcmV0") });
+        // A key file is multi-line text; it is stored as it came.
+        const keyFile = '{\n  "type": "service_account"\n}';
+        expect(data("google", { serviceAccountJson: keyFile })).toEqual({ serviceAccountJson: b64(keyFile) });
+    });
+
+    it("builds Azure's azure.json itself: the tenant from the options, the client from the credentials, JSON-encoded", () => {
+        const azure = provider({ type: "azure", options: { tenantId: GUID }, credentials: { keys: ["clientId", "clientSecret"], generation: 3 } });
+        // A quote, a backslash and a newline in the secret must come out as the same characters.
+        const clientSecret = 'se"cr\\et\n';
+        const secret = credentialsSecret(azure, { clientId: "client-1", clientSecret }, settings, OWNER_UID);
+        expect(Object.keys(secret.data)).toEqual(["azure.json"]);
+        expect(JSON.parse(Buffer.from(secret.data["azure.json"], "base64").toString("utf8"))).toEqual({
+            tenantId: GUID,
+            aadClientId: "client-1",
+            aadClientSecret: clientSecret,
         });
-        const spec = (externalSecret(azure, withOpenbao) as unknown as { spec: { target: { template: { data: Record<string, string> } } } }).spec;
-        expect(spec.target.template.data).toEqual({
-            "azure.json":
-                '{"tenantId":"11111111-2222-3333-4444-555555555555","aadClientId":{{ .clientId | toJson }},"aadClientSecret":{{ .clientSecret | toJson }}}',
-        });
+        expect(secret.metadata.annotations).toEqual({ "rapidmx.io/credentials-generation": "3" });
     });
 
-    it("refuses an Azure tenant that isn't a GUID, since it is written into a template", () => {
-        const azure = provider({ type: "azure", options: { tenantId: "{{ .clientSecret }}" }, secretRef: { backend: "openbao", path: "dns/p1", keys: ["clientId"], generation: 1 } });
-        expect(() => externalSecret(azure, withOpenbao)).toThrow("'tenantId' must be a GUID");
+    it("writes no azure.json until both Azure client fields are there (the instance runs no replica then)", () => {
+        const azure = provider({ type: "azure", options: { tenantId: GUID }, credentials: { keys: ["clientId"], generation: 1 } });
+        expect(credentialsSecret(azure, { clientId: "client-1" }, settings, OWNER_UID).data).toEqual({});
+        expect(credentialsSecret(azure, { clientSecret: "secret-1" }, settings, OWNER_UID).data).toEqual({});
     });
 
-    it("is none for a config without OpenBao credentials", () => {
-        expect(externalSecret(provider({ type: "route53" }), withOpenbao)).toBeUndefined();
-        expect(externalSecret(provider({ secretRef: { backend: "kubernetes", path: "dns/p1", keys: ["apiToken"], generation: 1 } }), withOpenbao)).toBeUndefined();
+    it("refuses an Azure tenant that isn't a GUID", () => {
+        for (const tenantId of ["{{ .clientSecret }}", "", undefined, GUID + "0", 5]) {
+            const azure = provider({ type: "azure", options: tenantId === undefined ? {} : { tenantId }, credentials: { keys: ["clientId", "clientSecret"], generation: 1 } });
+            expect(() => credentialsSecret(azure, { clientId: "a", clientSecret: "b" }, settings, OWNER_UID)).toThrow("'tenantId' must be a GUID");
+        }
     });
 
-    it("refuses an OpenBao reference when the controller has no SecretStore configured", () => {
-        expect(() => externalSecret(cloudflare, settings)).toThrow("OpenBao is not configured");
+    it("carries a value only as base64 data, never in the metadata", () => {
+        const secret = credentialsSecret(cloudflare, { apiToken: "super-secret-token" }, settings, OWNER_UID);
+        expect(JSON.stringify(secret.metadata)).not.toContain("super-secret-token");
     });
 });
 

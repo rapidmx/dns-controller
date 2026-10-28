@@ -2,18 +2,19 @@
 // Copyright (C) 2026 Jean-Philippe Steinmetz
 // SPDX-License-Identifier: MPL-2.0
 ///////////////////////////////////////////////////////////////////////////////
-import type { DesiredStateV1, DnsProviderV1, EndpointSetV1 } from "../api/v1.js";
+import type { ServerClient } from "../api/ServerClient.js";
+import { CREDENTIAL_FIELD, type DesiredStateV1, type DnsProviderV1, type EndpointSetV1 } from "../api/v1.js";
 import { isKubeStatus, type KubeClient } from "../kube/KubeClient.js";
 import type { Logger } from "../log.js";
 import {
     acceptsExternalDnsImage,
     ANNOTATION_CREDENTIALS_GENERATION,
+    credentialsSecret,
     credentialsSecretName,
     deploymentName,
     dnsEndpoint,
     dnsEndpointName,
     externalDnsDeployment,
-    externalSecret,
     FIELD_MANAGER,
     LABEL_MANAGED_BY,
     LABEL_PROVIDER,
@@ -22,10 +23,13 @@ import {
     nestedZones,
     type Manifest,
     type ManifestSettings,
+    type SecretManifest,
 } from "./manifests.js";
 
 export interface ReconcilerOptions {
     kube: Pick<KubeClient, "apply" | "get" | "getMetadata" | "delete">;
+    /** Where a provider's credentials come from when its Secret has to be written (7.3). */
+    server: Pick<ServerClient, "providerCredentials">;
     settings: ManifestSettings;
     /** Asked immediately before every write: the controller writes only while compatible and holding the Lease. */
     gate: { mayWrite(): boolean };
@@ -49,7 +53,7 @@ export interface PassOutcome {
     nextAt?: number;
 }
 
-/** What a pass is doing, for its log line when that fails: `apply`, `delete` or `list`, the kind, and the object. */
+/** What a pass is doing, for its log line when that fails: `read`, `apply`, `delete` or `list`, the kind, and the object. */
 type Step = Record<string, string>;
 
 /**
@@ -67,25 +71,45 @@ const PROVIDER_UID: RegExp = /^[a-z0-9]([a-z0-9-]{0,38}[a-z0-9])?$/;
 const ENDPOINT_SET_ID: RegExp = /^[a-z0-9]([a-z0-9-]{0,178}[a-z0-9])?$/;
 /** A zone as the server normalizes them: a lowercase domain name of at least two labels (never a top-level domain alone). */
 const ZONE: RegExp = /^(?=.{1,253}$)[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?(\.[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?)+$/;
-/** A DNS credentials path (5.1): under `dns/`, segments of letters, digits, `-` and `_`, so it never leaves that prefix. */
-const DNS_SECRET_PATH: RegExp = /^dns(\/[A-Za-z0-9_-]+)+$/;
-/** A credential field name: what a Secret key, an ExternalSecret property and an env reference may all be. */
-const SECRET_KEY: RegExp = /^[A-Za-z0-9_-]{1,253}$/;
 
 /** An object a list returned. It carries the controller's labels: the list selected it by them. */
 interface Listed {
     metadata: { name: string; labels: Record<string, string> };
 }
 
+/** An object the API server answered an apply with: all the controller needs from it is its uid. */
+interface Applied {
+    metadata?: { uid?: string };
+}
+
+/**
+ * What a provider's Secret is, from its metadata: whether this controller wrote it, the generation it holds (none when
+ * the annotation is gone or isn't a number) and the uids of the Deployments that own it.
+ */
+interface SecretState {
+    ours: boolean;
+    generation?: number;
+    ownerUids: string[];
+}
+
+/** What the pod template says about a Secret there whose generation is unknown: no generation the server gives, so the pod rolls once the Secret is rewritten. */
+const UNKNOWN_GENERATION = -1;
+
+/** Whether a Secret's labels say this controller wrote it for provider `uid` (the same test before any change or delete). */
+function isOurSecret(labels: Record<string, string> | undefined, uid: string): boolean {
+    return labels?.[LABEL_MANAGED_BY] === FIELD_MANAGER && labels[LABEL_SECRET_KIND] === "dns" && labels[LABEL_PROVIDER] === uid;
+}
+
 /**
  * Turns the desired state into the namespace's objects (spec 7.4, 7.5) and keeps them so:
  *
- * - **Per provider config:** with OpenBao credentials, the ExternalSecret that materializes them; then the external-dns
- * Deployment, only with the pinned image. Its pod template carries the credentials generation the Secret already holds,
- * so the pod rolls once new credentials are there, not before.
+ * - **Per provider config:** the external-dns Deployment, only with the pinned image, and the Secret it reads its
+ * credentials from, which the controller writes from the credentials the server sends it. The Secret is fetched and
+ * written when it is missing or holds another generation than the config's; the Deployment's pod template carries the
+ * generation the Secret already holds, so the pod rolls once new credentials are there, not before.
  * - **Per endpoint set:** its DNSEndpoint.
- * - **Pruning:** a DNSEndpoint or ExternalSecret it manages that the state no longer has is deleted. A deleted provider's
- * Deployment, ExternalSecret and Secret go one interval after its endpoints, so its instance can delete what it owns.
+ * - **Pruning:** a DNSEndpoint it manages that the state no longer has is deleted. A deleted provider's Secret and
+ * Deployment go one interval after its endpoints, so its instance can delete what it owns.
  *
  * Every write is a server-side apply as `rapidmx-dns-controller` (idempotent) or a delete, each checked against the gate
  * immediately before it. Passes never overlap; a state that arrives during one is applied right after it.
@@ -185,16 +209,21 @@ export class Reconciler {
         this.timer = setTimeout(() => this.request(), delay);
     }
 
-    /** Throws `NotWriterError` unless it may write now and isn't stopping; called immediately before every write. */
-    private async write<T>(call: () => Promise<T>): Promise<T> {
+    /** Throws `NotWriterError` unless it may write now and isn't stopping; asked before every write and before every fetch of credentials. */
+    private assertMayWrite(): void {
         if (this.stopped || !this.options.gate.mayWrite()) {
             throw new NotWriterError();
         }
+    }
+
+    /** Runs `call` once it has checked, immediately before, that it may write. */
+    private async write<T>(call: () => Promise<T>): Promise<T> {
+        this.assertMayWrite();
         return call();
     }
 
-    private apply(path: string, manifest: Manifest): Promise<unknown> {
-        return this.write(() => this.options.kube.apply(`${path}/${manifest.metadata.name}`, manifest, { fieldManager: FIELD_MANAGER, force: true }));
+    private apply(path: string, manifest: Pick<Manifest, "metadata"> | Pick<SecretManifest, "metadata">): Promise<Applied> {
+        return this.write(() => this.options.kube.apply<Applied>(`${path}/${manifest.metadata.name}`, manifest, { fieldManager: FIELD_MANAGER, force: true }));
     }
 
     /** Deletes `path`; one already gone counts as deleted. */
@@ -225,8 +254,8 @@ export class Reconciler {
      * Why the state can't be published safely, or undefined. Checked whole, before any write, like `parseDesiredState()`:
      * a provider without zones would run with no `--domain-filter` and act on every zone its credentials reach; a zone in
      * two configs would set two instances sharing the owner id against each other (a nested zone is kept out of the
-     * parent's instance instead, `nestedZones()`); a credentials path outside `dns/` would have External Secrets copy
-     * another of the deployment's secrets into an external-dns pod.
+     * parent's instance instead, `nestedZones()`); a credential field name that isn't plain would become an odd Secret key
+     * and environment reference.
      */
     private unpublishable(state: DesiredStateV1): string | undefined {
         const uids: Set<string> = new Set();
@@ -245,9 +274,8 @@ export class Reconciler {
                 }
                 zones.add(zone);
             }
-            const ref = provider.secretRef;
-            if (ref && (!DNS_SECRET_PATH.test(ref.path) || !ref.keys.every((key) => SECRET_KEY.test(key)))) {
-                return "a provider's credentials path or key name is malformed";
+            if (provider.credentials && !provider.credentials.keys.every((key) => CREDENTIAL_FIELD.test(key))) {
+                return "a provider's credential field name is malformed";
             }
         }
         const ids: Set<string> = new Set();
@@ -263,9 +291,9 @@ export class Reconciler {
         return undefined;
     }
 
-    /** The generation of the credentials the provider's Secret holds (its annotation), or undefined when it has none yet. */
-    private async secretGeneration(provider: DnsProviderV1): Promise<number | undefined> {
-        let meta: { metadata?: { annotations?: Record<string, string> } };
+    /** The provider's Secret as its metadata tells (never its data), or undefined when there is none. */
+    private async readSecret(provider: DnsProviderV1): Promise<SecretState | undefined> {
+        let meta: { metadata?: { labels?: Record<string, string>; annotations?: Record<string, string>; ownerReferences?: { kind?: string; uid?: string }[] } };
         try {
             meta = await this.options.kube.getMetadata(`${this.collection("/api/v1", "secrets")}/${credentialsSecretName(this.options.settings, provider.uid)}`);
         } catch (err) {
@@ -274,39 +302,153 @@ export class Reconciler {
             }
             throw err;
         }
-        const value = Number(meta.metadata?.annotations?.[ANNOTATION_CREDENTIALS_GENERATION]);
-        return Number.isSafeInteger(value) ? value : undefined;
+        const generation = Number(meta.metadata?.annotations?.[ANNOTATION_CREDENTIALS_GENERATION]);
+        const ownerUids: string[] = (meta.metadata?.ownerReferences ?? []).flatMap((owner) => (owner.kind === "Deployment" && owner.uid ? [owner.uid] : []));
+        return { ours: isOurSecret(meta.metadata?.labels, provider.uid), ownerUids, ...(Number.isSafeInteger(generation) ? { generation } : {}) };
+    }
+
+    /** The uid of the provider's Deployment as the API server answered the apply with it; a Deployment without one can own nothing. */
+    private ownerUid(deployment: Applied): string {
+        const uid: string | undefined = deployment.metadata?.uid;
+        if (!uid) {
+            throw new Error("the Deployment has no uid to own the Secret");
+        }
+        return uid;
+    }
+
+    /** The uid of the provider's Deployment that is there already, when the image pin keeps this pass from applying one; undefined without one. */
+    private async existingOwnerUid(provider: DnsProviderV1): Promise<string | undefined> {
+        try {
+            return this.ownerUid(
+                await this.options.kube.getMetadata<Applied>(`${this.collection("/apis/apps/v1", "deployments")}/${deploymentName(this.options.settings, provider.uid)}`)
+            );
+        } catch (err) {
+            if (isKubeStatus(err, 404)) {
+                return undefined;
+            }
+            throw err;
+        }
     }
 
     /**
-     * Applies one provider's objects: its ExternalSecret, then (with the pinned image) its Deployment, whose pod template
-     * carries the credentials generation its Secret already holds. True while newer credentials are still on their way.
+     * Applies one provider's objects: its Deployment (with the pinned image), whose pod template carries the credentials
+     * generation its Secret already holds, then the Secret itself when it is missing, behind, or owned by a Deployment that
+     * is not the one just applied (one recreated by hand gets a new uid, and the garbage collector would take the Secret
+     * with the old one). True while newer credentials are still on their way.
      */
     private async applyProvider(state: DesiredStateV1, provider: DnsProviderV1, imageAccepted: boolean, step: Step): Promise<boolean> {
-        const { settings, log } = this.options;
-        const secret: Manifest | undefined = externalSecret(provider, settings);
-        if (secret && settings.openbao) {
-            await this.apply(this.collection(`/apis/${settings.openbao.externalSecretsApiVersion}`, "externalsecrets"), secret);
+        const { settings } = this.options;
+        const wanted: number | undefined = provider.credentials?.generation;
+        const secret: SecretState | undefined = await this.readSecret(provider);
+        if (wanted !== undefined && secret && !secret.ours) {
+            // A name collision: never write over, or run an instance on, a Secret this controller didn't make.
+            throw new Error(`the Secret ${credentialsSecretName(settings, provider.uid)} exists but is not this controller's`);
         }
-        if (!imageAccepted) {
+        // A Secret not there yet counts as the config's generation: the pod starts once it appears, without rolling. One there
+        // with an unknown generation counts as older than any, so the pod rolls after it is rewritten, not before.
+        const held: number | undefined = secret?.generation;
+        let deployment: Applied | undefined;
+        if (imageAccepted) {
+            step.step = "apply";
+            step.kind = "Deployment";
+            deployment = await this.applyDeployment(state, provider, secret ? (held ?? UNKNOWN_GENERATION) : wanted);
+        }
+        if (wanted === undefined) {
+            // No credentials: no Secret, and one this controller wrote before goes, once the Deployment no longer refers to it.
+            if (secret?.ours) {
+                if (!deployment) {
+                    this.options.log.info("secret_delete_deferred", { providerUid: provider.uid, reason: "the Deployment that refers to the Secret was not updated" });
+                    return true;
+                }
+                step.step = "delete";
+                step.kind = "Secret";
+                await this.remove(`${this.collection("/api/v1", "secrets")}/${credentialsSecretName(settings, provider.uid)}`);
+            }
             return false;
         }
-        step.kind = "Deployment";
-        let generation: number | undefined;
-        let pending = false;
-        if (provider.secretRef) {
-            const held: number | undefined = await this.secretGeneration(provider);
-            generation = held ?? provider.secretRef.generation;
-            if (held !== undefined && held < provider.secretRef.generation) {
-                log.info("credentials_pending", { providerUid: provider.uid, generation: provider.secretRef.generation, secretGeneration: held });
-                pending = true;
-            }
+        // A Deployment answered without a uid can't be compared; a Secret that has to be written then is refused (`ownerUid()`).
+        const deploymentUid: string | undefined = deployment?.metadata?.uid;
+        if (secret && held === wanted && (deploymentUid === undefined || secret.ownerUids.includes(deploymentUid))) {
+            return false;
         }
-        await this.apply(
+        let ownerUid: string | undefined;
+        if (deployment) {
+            step.step = "apply";
+            step.kind = "Secret";
+            ownerUid = this.ownerUid(deployment);
+        } else {
+            // The image was refused: an instance that is there already can still own the Secret, none leaves it unwritten.
+            step.step = "read";
+            step.kind = "Deployment";
+            ownerUid = await this.existingOwnerUid(provider);
+            if (ownerUid === undefined) {
+                this.options.log.info("credentials_deferred", { providerUid: provider.uid, reason: "there is no Deployment to own the Secret" });
+                return true;
+            }
+            step.step = "apply";
+            step.kind = "Secret";
+        }
+        const written: boolean = await this.writeCredentials(provider, ownerUid);
+        if (written && imageAccepted && secret && held !== wanted) {
+            // The Secret held older (or unknown) credentials, and the pod template said so: now that it holds the new ones, this apply rolls the pod.
+            step.kind = "Deployment";
+            await this.applyDeployment(state, provider, wanted);
+        }
+        return !written;
+    }
+
+    private applyDeployment(state: DesiredStateV1, provider: DnsProviderV1, credentialsGeneration: number | undefined): Promise<Applied> {
+        const { settings } = this.options;
+        return this.apply(
             this.collection("/apis/apps/v1", "deployments"),
-            externalDnsDeployment(provider, state.ownerId, settings, generation, nestedZones(provider, state.providers))
+            externalDnsDeployment(provider, state.ownerId, settings, credentialsGeneration, nestedZones(provider, state.providers))
         );
-        return pending;
+    }
+
+    /**
+     * Fetches the provider's credentials from the server and applies the Secret owned by the Deployment with `ownerUid`.
+     * True when the Secret was written. Nothing is written, and the Secret there stays, for a fetch that failed, an answer
+     * at another generation than the config's (the next desired state brings the right one) or one that lacks a field the
+     * state lists. The values are in memory only for this call and are never logged.
+     */
+    private async writeCredentials(provider: DnsProviderV1, ownerUid: string): Promise<boolean> {
+        const { server, settings, log } = this.options;
+        const info = provider.credentials as NonNullable<DnsProviderV1["credentials"]>;
+        // A controller that may not write fetches no credentials either.
+        this.assertMayWrite();
+        const outcome = await server.providerCredentials(provider.uid);
+        if (outcome.state !== "ok") {
+            log.warn("credentials_fetch_failed", {
+                providerUid: provider.uid,
+                generation: info.generation,
+                state: outcome.state,
+                detail: "reason" in outcome ? outcome.reason : outcome.error,
+            });
+            return false;
+        }
+        const answer = outcome.value;
+        if (answer.providerUid !== provider.uid) {
+            log.warn("credentials_fetch_failed", {
+                providerUid: provider.uid,
+                generation: info.generation,
+                state: "invalid",
+                detail: "the answer is about another provider",
+            });
+            return false;
+        }
+        if (answer.generation !== info.generation) {
+            log.warn("credentials_stale", { providerUid: provider.uid, generation: info.generation, answered: answer.generation });
+            return false;
+        }
+        // Fields the state lists that the answer lacks, and fields the server says it couldn't decrypt: names only.
+        const unreadable: string[] = [...new Set([...info.keys.filter((key) => !Object.hasOwn(answer.values, key)), ...(answer.unreadable ?? [])])];
+        if (unreadable.length > 0) {
+            log.warn("credentials_unreadable", { providerUid: provider.uid, generation: info.generation, fields: unreadable });
+            return false;
+        }
+        await this.apply(this.collection("/api/v1", "secrets"), credentialsSecret(provider, answer.values, settings, ownerUid));
+        log.info("credentials_written", { providerUid: provider.uid, generation: info.generation });
+        return true;
     }
 
     /**
@@ -346,7 +488,7 @@ export class Reconciler {
             }
             const types: Map<string, DnsProviderV1["type"]> = new Map(state.providers.map((p) => [p.uid, p.type]));
             for (const provider of state.providers) {
-                const step: Step = { step: "apply", kind: "ExternalSecret", providerUid: provider.uid };
+                const step: Step = { step: "read", kind: "Secret", providerUid: provider.uid };
                 await attempt(step, async () => {
                     failed = (await this.applyProvider(state, provider, imageAccepted, step)) || failed;
                 });
@@ -375,23 +517,15 @@ export class Reconciler {
         const { settings } = this.options;
         const endpoints: string = this.collection("/apis/externaldns.k8s.io/v1alpha1", "dnsendpoints");
         const deployments: string = this.collection("/apis/apps/v1", "deployments");
-        const externalSecrets: string | undefined = settings.openbao
-            ? this.collection(`/apis/${settings.openbao.externalSecretsApiVersion}`, "externalsecrets")
-            : undefined;
         let listedEndpoints: Listed[] = [];
         let listedDeployments: Listed[] = [];
-        let listedSecrets: Listed[] = [];
         const listed: boolean =
             (await attempt({ step: "list", kind: "DNSEndpoint" }, async () => {
                 listedEndpoints = await this.list(endpoints);
             })) &&
             (await attempt({ step: "list", kind: "Deployment" }, async () => {
                 listedDeployments = await this.list(deployments);
-            })) &&
-            (!externalSecrets ||
-                (await attempt({ step: "list", kind: "ExternalSecret" }, async () => {
-                    listedSecrets = await this.list(externalSecrets);
-                })));
+            }));
         if (!listed) {
             return undefined;
         }
@@ -405,29 +539,17 @@ export class Reconciler {
             }
         }
 
-        const desired: Map<string, DnsProviderV1> = new Map(state.providers.map((p) => [p.uid, p]));
-        // The ExternalSecret of a provider still wanted whose credentials left OpenBao.
-        for (const item of listedSecrets) {
-            const provider: DnsProviderV1 | undefined = desired.get(item.metadata.labels[LABEL_PROVIDER]);
-            if (provider && provider.secretRef?.backend !== "openbao") {
-                await attempt({ step: "delete", kind: "ExternalSecret", name: item.metadata.name }, () => this.remove(`${externalSecrets}/${item.metadata.name}`));
+        // The deleted providers: an instance labelled for a uid the state no longer has. Secrets are never listed; the
+        // instance is the one mark of a deleted provider.
+        const desired: Set<string> = new Set(state.providers.map((p) => p.uid));
+        const gone: Map<string, string> = new Map();
+        for (const item of listedDeployments) {
+            const uid: string = item.metadata.labels[LABEL_PROVIDER];
+            if (!desired.has(uid)) {
+                gone.set(uid, item.metadata.name);
             }
         }
-
-        // The deleted providers: an instance or an ExternalSecret labelled for a uid the state no longer has.
-        const gone: Map<string, { deployment?: string; externalSecret?: string }> = new Map();
-        for (const [items, field] of [
-            [listedDeployments, "deployment"],
-            [listedSecrets, "externalSecret"],
-        ] as const) {
-            for (const item of items) {
-                const uid: string = item.metadata.labels[LABEL_PROVIDER];
-                if (!desired.has(uid)) {
-                    gone.set(uid, { ...gone.get(uid), [field]: item.metadata.name });
-                }
-            }
-        }
-        // A provider that came back, or whose objects are gone, starts over if it is deleted again.
+        // A provider that came back, or whose instance is gone, starts over if it is deleted again.
         for (const uid of this.removals.keys()) {
             if (!gone.has(uid)) {
                 this.removals.delete(uid);
@@ -435,7 +557,7 @@ export class Reconciler {
         }
         let nextAt: number | undefined;
         const now: number = this.now();
-        for (const [uid, objects] of gone) {
+        for (const [uid, deployment] of gone) {
             if (endpointsLeft.has(uid)) {
                 continue;
             }
@@ -446,29 +568,19 @@ export class Reconciler {
                 nextAt = Math.min(nextAt ?? due, due);
                 continue;
             }
-            const step: Step = { step: "delete", kind: "ExternalSecret", providerUid: uid };
-            await attempt(step, () => this.removeProvider(uid, objects, deployments, externalSecrets, step));
+            const step: Step = { step: "delete", kind: "Secret", providerUid: uid };
+            await attempt(step, () => this.removeProvider(uid, deployment, deployments, step));
         }
         return nextAt;
     }
 
     /**
-     * A deleted provider's ExternalSecret, its Secret (only when its labels say it is that provider's), then its instance.
-     * The instance goes last: with the Kubernetes backend it is the only object that marks the provider as deleted, so a
-     * failure before it leaves that mark for the next pass, never a Secret of live credentials nothing points at.
+     * A deleted provider's Secret (only when its labels say it is that provider's), then its instance. The instance goes
+     * last: it is the only object that marks the provider as deleted, so a failure before it leaves that mark for the next
+     * pass, never a Secret of live credentials nothing points at.
      */
-    private async removeProvider(
-        uid: string,
-        objects: { deployment?: string; externalSecret?: string },
-        deployments: string,
-        externalSecrets: string | undefined,
-        step: Step
-    ): Promise<void> {
+    private async removeProvider(uid: string, deployment: string, deployments: string, step: Step): Promise<void> {
         const { settings, kube, log } = this.options;
-        if (objects.externalSecret) {
-            await this.remove(`${externalSecrets}/${objects.externalSecret}`);
-        }
-        step.kind = "Secret";
         const secret: string = `${this.collection("/api/v1", "secrets")}/${credentialsSecretName(settings, uid)}`;
         const labels: Record<string, string> | undefined = await kube.getMetadata<Listed>(secret).then(
             (meta) => meta.metadata.labels,
@@ -479,13 +591,11 @@ export class Reconciler {
                 throw err;
             }
         );
-        if (labels?.[LABEL_MANAGED_BY] === FIELD_MANAGER && labels[LABEL_SECRET_KIND] === "dns" && labels[LABEL_PROVIDER] === uid) {
+        if (isOurSecret(labels, uid)) {
             await this.remove(secret);
         }
         step.kind = "Deployment";
-        if (objects.deployment) {
-            await this.remove(`${deployments}/${objects.deployment}`);
-        }
+        await this.remove(`${deployments}/${deployment}`);
         this.removals.delete(uid);
         log.info("external_dns_removed", { providerUid: uid, deployment: deploymentName(settings, uid) });
     }

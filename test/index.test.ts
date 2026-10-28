@@ -17,11 +17,17 @@ describe("startController / runMain", () => {
         if (request.method === "GET") {
             return { status: 404, body: JSON.stringify({ kind: "Status", reason: "NotFound" }) };
         }
-        return { status: 201, body: request.body ?? "" };
+        // An apply answers with the object, to which the API server has given a uid.
+        const applied = request.method === "PATCH" && request.body ? JSON.parse(request.body) : undefined;
+        if (applied) {
+            applied.metadata.uid = `uid-of-${applied.metadata.name}`;
+        }
+        return { status: 201, body: applied ? JSON.stringify(applied) : (request.body ?? "") };
     };
     const json = (body: unknown): Response => new Response(JSON.stringify(body), { status: 200, headers: { "Content-Type": "application/json" } });
     const desiredState = JSON.parse(readFileSync(new URL("./fixtures/api/v1/desired-state.json", import.meta.url), "utf8"));
-    /** The server: the handshake, the desired state (a long poll that is never answered), and the status report. */
+    const credentials = JSON.parse(readFileSync(new URL("./fixtures/api/v1/provider-credentials.json", import.meta.url), "utf8"));
+    /** The server: the handshake, the desired state (a long poll that is never answered), a provider's credentials, and the status report. */
     const fakeFetch = (async (url: string, init: RequestInit) => {
         fetchCalls.push([url, init]);
         if (url.endsWith("/handshake")) {
@@ -32,6 +38,9 @@ describe("startController / runMain", () => {
         }
         if (url.endsWith("/v1/desired-state")) {
             return json(desiredState);
+        }
+        if (url.endsWith("/v1/providers/cloudflare-main/credentials")) {
+            return json(credentials);
         }
         return json({ apiVersion: "dns.rapidmx.io/v1", kind: "StatusReportResult" });
     }) as unknown as typeof fetch;
@@ -52,8 +61,6 @@ describe("startController / runMain", () => {
             POD_NAME: "mail-dns-controller-abc",
             DNS_CONTROLLER_FULLNAME: "mail",
             DNS_CONTROLLER_RELEASE: "mail",
-            DNS_CONTROLLER_OPENBAO_SECRET_STORE: "mail-openbao",
-            DNS_CONTROLLER_OPENBAO_PATH_PREFIX: "mail/integrations",
         };
         fetchCalls = [];
         kubeRequests = [];
@@ -101,14 +108,25 @@ describe("startController / runMain", () => {
                 "POST /apis/coordination.k8s.io/v1/namespaces/rapidmx/leases",
             ]);
             await waitFor(() => fetchCalls.some(([url]) => url.endsWith("/v1/desired-state?since=42")));
-            // The desired state is reconciled into the namespace: the provider's instance and the domain's DNSEndpoint.
+            // The desired state is reconciled into the namespace: the provider's instance, its Secret from the credentials the server
+            // sends, and the domain's DNSEndpoint.
             await waitFor(() => kubeRequests.some((r) => r.method === "PATCH" && r.url.pathname.endsWith("/dnsendpoints/mail-domain-example-com")));
             const applied = kubeRequests.filter((r) => r.method === "PATCH").map((r) => r.url.pathname);
             expect(applied).toEqual([
-                "/apis/external-secrets.io/v1/namespaces/rapidmx/externalsecrets/mail-dns-cloudflare-main",
                 "/apis/apps/v1/namespaces/rapidmx/deployments/mail-external-dns-cloudflare-main",
+                "/api/v1/namespaces/rapidmx/secrets/mail-dns-cloudflare-main",
                 "/apis/externaldns.k8s.io/v1alpha1/namespaces/rapidmx/dnsendpoints/mail-domain-example-com",
             ]);
+            // The Secret holds what the server sent, owned by the Deployment, and the controller asked with its projected token.
+            const secret = JSON.parse(String(kubeRequests.find((r) => r.method === "PATCH" && r.url.pathname.endsWith("/secrets/mail-dns-cloudflare-main")).body));
+            expect(secret).toMatchObject({
+                kind: "Secret",
+                data: { apiToken: Buffer.from("cf-example-token-not-a-real-secret").toString("base64") },
+                metadata: { ownerReferences: [{ kind: "Deployment", name: "mail-external-dns-cloudflare-main", uid: "uid-of-mail-external-dns-cloudflare-main" }] },
+            });
+            const fetchedCredentials = fetchCalls.find(([url]) => url.endsWith("/v1/providers/cloudflare-main/credentials"));
+            expect(fetchedCredentials[1].headers).toMatchObject({ Authorization: "Bearer projected" });
+            expect(lines.join("\n")).not.toContain("cf-example-token-not-a-real-secret");
             const urls = fetchCalls.map(([url]) => url);
             expect(urls.slice(0, 2)).toEqual(["http://mail:3000/internal/dns/handshake", "http://mail:3000/internal/dns/v1/desired-state"]);
             expect(urls).toContain("http://mail:3000/internal/dns/v1/status");

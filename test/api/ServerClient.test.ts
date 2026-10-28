@@ -310,3 +310,56 @@ describe("ServerClient.reportStatus", () => {
         expect(await client(new Response("ok", { status: 200 })).c.reportStatus(report)).toEqual({ state: "invalid", error: "the answer was not JSON" });
     });
 });
+
+describe("ServerClient.providerCredentials", () => {
+    it("GETs a provider's credentials under /v1 with the projected token and reads them", async () => {
+        const { c, calls } = client(jsonResponse(fixture("provider-credentials")));
+        expect(await c.providerCredentials("cloudflare-main")).toEqual({
+            state: "ok",
+            value: {
+                apiVersion: "dns.rapidmx.io/v1",
+                kind: "DnsProviderCredentials",
+                providerUid: "cloudflare-main",
+                generation: 1,
+                values: { apiToken: "cf-example-token-not-a-real-secret" },
+            },
+        });
+        const [url, init] = calls[0];
+        expect(url).toBe("http://mail:3000/internal/dns/v1/providers/cloudflare-main/credentials");
+        expect(init.method).toBe("GET");
+        expect(init.headers).toMatchObject({ Accept: "application/json", Authorization: "Bearer projected-token" });
+        expect(init.body).toBeUndefined();
+        expect(init.signal).toBeInstanceOf(AbortSignal);
+    });
+
+    it("names the fields the server could not decrypt", async () => {
+        const outcome = await client(jsonResponse(fixture("provider-credentials-unreadable"))).c.providerCredentials("aws-main");
+        expect(outcome.state === "ok" && outcome.value.unreadable).toEqual(["secretAccessKey"]);
+    });
+
+    it("never builds a path from anything but the uid, escaped", async () => {
+        const { c, calls } = client(jsonResponse(fixture("provider-credentials")));
+        await c.providerCredentials("a/../b?x");
+        expect(calls[0][0]).toBe("http://mail:3000/internal/dns/v1/providers/a%2F..%2Fb%3Fx/credentials");
+    });
+
+    it.each([
+        ["a config that is gone (404)", new Response("", { status: 404 }), { state: "incompatible", reason: "the server has no dns.rapidmx.io/v1 DNS API (404)" }],
+        ["a refused token", new Response("", { status: 403 }), { state: "unavailable", error: "the server refused the controller's token (HTTP 403)" }],
+        ["a server without a cipher", jsonResponse({ code: "x" }, 503), { state: "unavailable", error: "HTTP 503" }],
+        ["a network error", new Error("fetch failed"), { state: "unavailable", error: "fetch failed" }],
+        ["an answer that is not JSON", new Response("<html>", { status: 200 }), { state: "invalid", error: "the answer was not JSON" }],
+        [
+            "an answer of another version",
+            jsonResponse({ ...(fixture("provider-credentials") as object), apiVersion: "dns.rapidmx.io/v2" }),
+            { state: "incompatible", reason: 'unsupported apiVersion "dns.rapidmx.io/v2"; this controller speaks dns.rapidmx.io/v1' },
+        ],
+    ])("reports %s", async (_label, answer, outcome) => {
+        expect(await client(answer).c.providerCredentials("cloudflare-main")).toEqual(outcome);
+    });
+
+    it("reports a malformed answer as invalid without repeating a value", async () => {
+        const outcome = await client(jsonResponse({ ...(fixture("provider-credentials") as object), values: { apiToken: 7 } })).c.providerCredentials("cloudflare-main");
+        expect(outcome).toEqual({ state: "invalid", error: "'values.apiToken' must be text" });
+    });
+});

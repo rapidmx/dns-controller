@@ -86,6 +86,8 @@ export async function startController(env: NodeJS.ProcessEnv = process.env, over
     });
     const reconciler = new Reconciler({
         kube,
+        // The credentials of a provider whose Secret has to be written come from the server.
+        server,
         settings: {
             namespace,
             fullname: config.fullname,
@@ -93,7 +95,6 @@ export async function startController(env: NodeJS.ProcessEnv = process.env, over
             externalDnsImage: config.externalDnsImage,
             externalDnsServiceAccount: config.externalDnsServiceAccount,
             externalDnsResources: config.externalDnsResources,
-            openbao: config.openbao,
         },
         // Writes only while compatible and holding the Lease, asked before every write.
         gate: controller,

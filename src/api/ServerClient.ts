@@ -8,9 +8,11 @@ import {
     ApiVersionError,
     expectV1,
     parseDesiredState,
+    parseProviderCredentials,
     SUPPORTED_API_VERSIONS,
     versionPath,
     type DesiredStateV1,
+    type DnsProviderCredentialsV1,
     type Handshake,
     type HandshakeResult,
     type StatusReportResultV1,
@@ -227,6 +229,14 @@ export class ServerClient {
         const query: string = since !== undefined ? `?since=${since}` : "";
         const timeoutMs: number = since !== undefined ? this.options.longPollTimeoutMs : this.options.timeoutMs;
         return this.callV1("GET", `/desired-state${query}`, undefined, timeoutMs, parseDesiredState, signal);
+    }
+
+    /**
+     * `GET <base>/v1/providers/:uid/credentials`: the provider's credentials, decrypted by the server. A 404 is also a
+     * config that is gone, so the caller treats any outcome but `ok` as "keep what you have and try again".
+     */
+    providerCredentials(uid: string, signal?: AbortSignal): Promise<CallOutcome<DnsProviderCredentialsV1>> {
+        return this.callV1("GET", `/providers/${encodeURIComponent(uid)}/credentials`, undefined, this.options.timeoutMs, parseProviderCredentials, signal);
     }
 
     /** `PUT <base>/v1/status`, answered with a `StatusReportResult`. */

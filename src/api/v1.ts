@@ -14,7 +14,7 @@
 //   mismatched versions find out that they are.
 //
 // restapi's copy also has the readers of what the controller sends (`negotiateHandshake`, `parseStatusReport`); this one
-// has the reader of what the server sends (`parseDesiredState`).
+// has the readers of what the server sends (`parseDesiredState`, `parseProviderCredentials`).
 
 /** The API version this controller speaks. */
 export const API_VERSION_V1 = "dns.rapidmx.io/v1";
@@ -59,13 +59,18 @@ export const DNS_RECORD_KINDS = ["A", "AAAA", "CNAME", "MX", "TXT", "SRV"] as co
 export type DnsRecordKind = (typeof DNS_RECORD_KINDS)[number];
 export const OPERATION_TYPES = ["test", "takeover", "restore"] as const;
 
-/** Where a provider's credentials are: a reference, never the value. */
-export interface SecretRefV1 {
-    backend: "openbao" | "kubernetes";
-    path: string;
+/**
+ * Which credentials a provider has saved, never their values: the names of the fields and the generation they are at,
+ * which the controller compares with the one its external-dns Secret was written for. The values come from
+ * `GET <base>/v1/providers/:uid/credentials` (`DnsProviderCredentialsV1`).
+ */
+export interface DnsProviderCredentialsInfoV1 {
     keys: string[];
     generation: number;
 }
+
+/** A credential field name: what becomes a key of the provider's Secret and an environment reference. */
+export const CREDENTIAL_FIELD: RegExp = /^[A-Za-z0-9_-]{1,253}$/;
 
 export interface DnsProviderV1 {
     uid: string;
@@ -73,8 +78,22 @@ export interface DnsProviderV1 {
     zones: string[];
     /** Non-secret, type-specific options. A value may be a list (Cloudflare's `zoneIds`, rfc2136's `hosts`). */
     options: Record<string, string | number | boolean | string[]>;
-    secretRef?: SecretRefV1;
+    /** Left out for a config without credentials (Route 53 through IRSA, unsigned rfc2136, or every credential cleared). */
+    credentials?: DnsProviderCredentialsInfoV1;
     enabled: boolean;
+}
+
+/**
+ * `GET <base>/v1/providers/:uid/credentials`: a provider's credentials in plaintext, decrypted by the server, for the
+ * controller to write the one Secret external-dns reads. `values` is empty for a config without credentials; a field the
+ * server couldn't decrypt is left out of it and named in `unreadable` (only present then), and the controller keeps the
+ * Secret it has.
+ */
+export interface DnsProviderCredentialsV1 extends V1Envelope<"DnsProviderCredentials"> {
+    providerUid: string;
+    generation: number;
+    values: Record<string, string>;
+    unreadable?: string[];
 }
 
 export interface DnsRecordV1 {
@@ -255,17 +274,11 @@ function readRecord(entry: Fields, at: string): DnsRecordV1 {
     return record;
 }
 
-function readSecretRef(value: unknown, at: string): SecretRefV1 {
-    if (
-        !isObject(value) ||
-        (value.backend !== "openbao" && value.backend !== "kubernetes") ||
-        !isText(value.path) ||
-        !isTextList(value.keys) ||
-        !isCount(value.generation)
-    ) {
-        throw new DnsApiPayloadError(`'${at}secretRef' must be a secret reference`);
+function readCredentialsInfo(value: unknown, at: string): DnsProviderCredentialsInfoV1 {
+    if (!isObject(value) || !isTextList(value.keys) || !isCount(value.generation)) {
+        throw new DnsApiPayloadError(`'${at}credentials' must be the saved credential fields and their generation`);
     }
-    return { backend: value.backend, path: value.path, keys: [...value.keys], generation: value.generation };
+    return { keys: [...value.keys], generation: value.generation };
 }
 
 function readProvider(entry: Fields, at: string): DnsProviderV1 {
@@ -292,8 +305,8 @@ function readProvider(entry: Fields, at: string): DnsProviderV1 {
     }
     const provider: DnsProviderV1 = { uid, type, zones: [...entry.zones], options, enabled: entry.enabled };
     // A config without credentials (Route 53 through IRSA, unsigned rfc2136) has none; `null` means the same.
-    if (entry.secretRef !== undefined && entry.secretRef !== null) {
-        provider.secretRef = readSecretRef(entry.secretRef, at);
+    if (entry.credentials !== undefined && entry.credentials !== null) {
+        provider.credentials = readCredentialsInfo(entry.credentials, at);
     }
     return provider;
 }
@@ -345,4 +358,46 @@ export function parseDesiredState(payload: unknown): DesiredStateV1 {
         endpointSets: list(state, "endpointSets", "", readEndpointSet),
         operations: list(state, "operations", "", readOperation),
     };
+}
+
+/**
+ * Reads the server's `DnsProviderCredentials`: the envelope (`ApiVersionError` for another version or kind), then every
+ * field v1 defines; unknown fields are left out. A malformed field refuses the whole answer (`DnsApiPayloadError`), whose
+ * message names the field and never repeats a value: the controller logs it.
+ */
+export function parseProviderCredentials(payload: unknown): DnsProviderCredentialsV1 {
+    const answer = expectV1<DnsProviderCredentialsV1>(payload, "DnsProviderCredentials") as unknown as Fields;
+    const providerUid: string = text(answer, "providerUid", "");
+    if (!isCount(answer.generation)) {
+        throw new DnsApiPayloadError("'generation' must be a whole number");
+    }
+    if (!isObject(answer.values)) {
+        throw new DnsApiPayloadError("'values' must be an object");
+    }
+    const entries: [string, string][] = [];
+    for (const [key, value] of Object.entries(answer.values)) {
+        // The name is checked before it is put in a message, and a value never is.
+        if (!CREDENTIAL_FIELD.test(key)) {
+            throw new DnsApiPayloadError("'values' has a field name that is not a credential field name");
+        }
+        if (!isText(value)) {
+            throw new DnsApiPayloadError(`'values.${key}' must be text`);
+        }
+        entries.push([key, value]);
+    }
+    const credentials: DnsProviderCredentialsV1 = {
+        apiVersion: API_VERSION_V1,
+        kind: "DnsProviderCredentials",
+        providerUid,
+        generation: answer.generation,
+        // fromEntries defines own properties, so a field named `__proto__` is a field, not a prototype.
+        values: Object.fromEntries(entries),
+    };
+    if (answer.unreadable !== undefined) {
+        if (!isTextList(answer.unreadable)) {
+            throw new DnsApiPayloadError("'unreadable' must be a list of text");
+        }
+        credentials.unreadable = [...answer.unreadable];
+    }
+    return credentials;
 }

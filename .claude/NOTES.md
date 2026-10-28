@@ -262,3 +262,26 @@ first release.
 - Review resolved (2 findings): the stale Service/NetworkPolicy standing decision corrected; the JWKS assertion could not
   fail (the verifier fetched keys lazily, inside `verify()`, only for a request to the API port) so it was dropped; the
   closed-port check is the guard.
+
+### D2 - credentials from the server (C3 rework)
+
+- Removed the `ExternalSecret` path: its manifest and Azure template, `OpenbaoSettings` and the three OpenBao and External
+  Secrets settings (a chart that still sets them is ignored, not refused), the pruning of ExternalSecrets and the
+  `secretRef` path check (now a credential field-name check). `DnsProviderV1.secretRef` became
+  `credentials?: { keys, generation }` in `src/api/v1.ts`; the three fixtures are byte-identical with restapi's.
+- `ServerClient.providerCredentials(uid)` calls `GET /v1/providers/:uid/credentials`. The Reconciler takes a `server`
+  option and, when a provider's Secret is missing, holds another generation, has none, or is owned by another Deployment
+  than the one just applied, fetches and applies it (labels, annotation, ownerReference with `apiVersion`, `kind`, `name`
+  and `uid` only; Azure's `azure.json` built by `credentialsSecret()`). Order: Deployment, Secret, Deployment again to roll
+  the pod. The existing Secret is kept on a failed fetch, an answer about another provider or at another generation, or an
+  unreadable or missing field. A Secret without this controller's three labels is never written over or run on.
+- Beyond the spec text (now in 7.3/7.4): any answer generation other than the listed one writes nothing; with the image
+  refused the Secret is written only for an instance that exists (`credentials_deferred`); the 404 of the credentials route
+  is a plain failed fetch.
+- Review resolved (3 findings): a Secret whose generation annotation is gone is stamped `-1` on the first Deployment apply,
+  so the apply after the write rolls the pod (it used to stamp the wanted generation and roll on the old data, once);
+  a no-longer-needed Secret is deleted only after a Deployment apply (`secret_delete_deferred` while the image is refused,
+  since the Deployment still refers to it); a Secret whose owner uid is not the applied Deployment's is written again
+  (only checked when the Deployment was applied this pass; with the image refused nothing recreates the Deployment).
+- Tests first, each failing without its fix; `yarn build` and `yarn test` pass (334 tests, 100% coverage). Spec text in
+  restapi 7bd4bf3.

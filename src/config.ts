@@ -47,17 +47,6 @@ export interface ControllerConfig {
     externalDnsResources?: Record<string, unknown>;
     /** How often the whole desired state is reconciled again while nothing changes. */
     resyncMinutes: number;
-    /** Where External Secrets reads DNS credentials kept in OpenBao; unset when the deployment has no OpenBao. */
-    openbao?: OpenbaoSettings;
-}
-
-export interface OpenbaoSettings {
-    /** The release's `SecretStore` (`<fullname>-openbao`). */
-    secretStore: string;
-    /** The integrations prefix inside the KV mount (`<fullname>/integrations`), which a `SecretRef` path is under. */
-    pathPrefix: string;
-    /** `external-secrets.io/v1`, or `v1beta1` on an older External Secrets. */
-    externalSecretsApiVersion: string;
 }
 
 /** The external-dns release the controller is built and tested against (spec 7.4). */
@@ -141,32 +130,6 @@ function jsonObject(env: NodeJS.ProcessEnv, name: string): Record<string, unknow
     return value as Record<string, unknown>;
 }
 
-/** The SecretStore and KV prefix External Secrets reads DNS credentials through: both, or neither (no OpenBao). */
-function openbaoSettings(env: NodeJS.ProcessEnv): OpenbaoSettings | undefined {
-    const store: string | undefined = env.DNS_CONTROLLER_OPENBAO_SECRET_STORE?.trim();
-    const prefix: string | undefined = env.DNS_CONTROLLER_OPENBAO_PATH_PREFIX?.trim().replace(/^\/+|\/+$/g, "");
-    if (!store && !prefix) {
-        return undefined;
-    }
-    if (!store || !prefix) {
-        throw new ConfigError("DNS_CONTROLLER_OPENBAO_SECRET_STORE and DNS_CONTROLLER_OPENBAO_PATH_PREFIX: set both or neither.");
-    }
-    if (!/^[A-Za-z0-9_-]+(\/[A-Za-z0-9_-]+)*$/.test(prefix)) {
-        throw new ConfigError(`DNS_CONTROLLER_OPENBAO_PATH_PREFIX must be a KV path: segments of letters, digits, '-' and '_' (got '${prefix}').`);
-    }
-    const apiVersion: string = optional(env, "DNS_CONTROLLER_EXTERNAL_SECRETS_API_VERSION", "external-secrets.io/v1");
-    if (apiVersion !== "external-secrets.io/v1" && apiVersion !== "external-secrets.io/v1beta1") {
-        throw new ConfigError(
-            `DNS_CONTROLLER_EXTERNAL_SECRETS_API_VERSION must be external-secrets.io/v1 or external-secrets.io/v1beta1 (got '${apiVersion}').`
-        );
-    }
-    return {
-        secretStore: kubernetesName("DNS_CONTROLLER_OPENBAO_SECRET_STORE", store),
-        pathPrefix: prefix,
-        externalSecretsApiVersion: apiVersion,
-    };
-}
-
 /** Reads and validates the configuration. Throws `ConfigError` naming the first bad variable. */
 export function loadConfig(env: NodeJS.ProcessEnv = process.env): ControllerConfig {
     const serverUrl: string = httpUrl("DNS_CONTROLLER_SERVER_URL", required(env, "DNS_CONTROLLER_SERVER_URL"));
@@ -189,7 +152,6 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): ControllerConf
         throw new ConfigError(`DNS_CONTROLLER_EXTERNAL_DNS_IMAGE must be an image reference (got '${externalDnsImage}').`);
     }
     const externalDnsResources: Record<string, unknown> | undefined = jsonObject(env, "DNS_CONTROLLER_EXTERNAL_DNS_RESOURCES");
-    const openbao: OpenbaoSettings | undefined = openbaoSettings(env);
     return {
         serverUrl,
         serverTokenFile: optional(env, "DNS_CONTROLLER_SERVER_TOKEN_FILE", DEFAULT_SERVER_TOKEN_FILE),
@@ -215,6 +177,5 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): ControllerConf
         ),
         ...(externalDnsResources ? { externalDnsResources } : {}),
         resyncMinutes: integer(env, "DNS_CONTROLLER_RESYNC_MINUTES", 10, 1, 1440),
-        ...(openbao ? { openbao } : {}),
     };
 }

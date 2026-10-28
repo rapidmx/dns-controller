@@ -5,9 +5,11 @@ import {
     DnsApiPayloadError,
     expectV1,
     parseDesiredState,
+    parseProviderCredentials,
     SUPPORTED_API_VERSIONS,
     versionPath,
     type DesiredStateV1,
+    type DnsProviderCredentialsV1,
     type StatusReportResultV1,
     type StatusReportV1,
 } from "../../src/api/v1.js";
@@ -87,7 +89,7 @@ describe("parseDesiredState", () => {
                     type: "cloudflare",
                     zones: ["example.com"],
                     options: { zoneIds: ["0123456789abcdef0123456789abcdef"] },
-                    secretRef: { backend: "openbao", path: "dns/cloudflare-main", keys: ["apiToken"], generation: 1 },
+                    credentials: { keys: ["apiToken"], generation: 1 },
                     enabled: true,
                 },
             ],
@@ -107,7 +109,7 @@ describe("parseDesiredState", () => {
         expect(parsed).not.toHaveProperty("futureField");
     });
 
-    it("reads every optional field: no secret, the hosts' set, options of every type, operations with and without records", () => {
+    it("reads every optional field: no credentials, the hosts' set, options of every type, operations with and without records", () => {
         const parsed = parseDesiredState(
             state((s) => {
                 s.providers.push({
@@ -115,7 +117,7 @@ describe("parseDesiredState", () => {
                     type: "rfc2136",
                     zones: ["example.org"],
                     options: { hosts: ["10.0.0.53"], port: 53, insecure: true, zone: "example.org" },
-                    secretRef: null,
+                    credentials: null,
                     enabled: false,
                     unknown: 1,
                 });
@@ -178,11 +180,13 @@ describe("parseDesiredState", () => {
         ["providers", (s: any) => (s.providers[0].options = { zoneIds: [1] }), `'providers[0].options.zoneIds' ${options}`],
         ["providers", (s: any) => (s.providers[0].options = { ttl: Infinity }), `'providers[0].options.ttl' ${options}`],
         ["providers", (s: any) => (s.providers[0].options = { nested: {} }), `'providers[0].options.nested' ${options}`],
-        ["providers", (s: any) => (s.providers[0].secretRef = "dns/x"), "'providers[0].secretRef' must be a secret reference"],
-        ["providers", (s: any) => (s.providers[0].secretRef.backend = "vault"), "'providers[0].secretRef' must be a secret reference"],
-        ["providers", (s: any) => (s.providers[0].secretRef.path = ""), "'providers[0].secretRef' must be a secret reference"],
-        ["providers", (s: any) => (s.providers[0].secretRef.keys = [3]), "'providers[0].secretRef' must be a secret reference"],
-        ["providers", (s: any) => (s.providers[0].secretRef.generation = 1.5), "'providers[0].secretRef' must be a secret reference"],
+        ["providers", (s: any) => (s.providers[0].credentials = "dns/x"), "'providers[0].credentials' must be the saved credential fields and their generation"],
+        ["providers", (s: any) => (s.providers[0].credentials = []), "'providers[0].credentials' must be the saved credential fields and their generation"],
+        ["providers", (s: any) => delete s.providers[0].credentials.keys, "'providers[0].credentials' must be the saved credential fields and their generation"],
+        ["providers", (s: any) => (s.providers[0].credentials.keys = [3]), "'providers[0].credentials' must be the saved credential fields and their generation"],
+        ["providers", (s: any) => (s.providers[0].credentials.keys = ["apiToken", ""]), "'providers[0].credentials' must be the saved credential fields and their generation"],
+        ["providers", (s: any) => (s.providers[0].credentials.generation = 1.5), "'providers[0].credentials' must be the saved credential fields and their generation"],
+        ["providers", (s: any) => (s.providers[0].credentials.generation = -1), "'providers[0].credentials' must be the saved credential fields and their generation"],
         ["providers", (s: any) => (s.providers[0].enabled = "true"), "'providers[0].enabled' must be true or false"],
         ["endpointSets", (s: any) => (s.endpointSets = undefined), "'endpointSets' must be a list"],
         ["endpointSets", (s: any) => (s.endpointSets[0].id = ""), "'endpointSets[0].id' must be text"],
@@ -214,5 +218,70 @@ describe("parseDesiredState", () => {
         }
         expect(err).toBeInstanceOf(DnsApiPayloadError);
         expect(err).toMatchObject({ name: "DnsApiPayloadError", message });
+    });
+});
+
+describe("parseProviderCredentials", () => {
+    /** A copy of the fixture with `patch` applied. */
+    function answer(patch: (a: any) => unknown = () => undefined, name = "provider-credentials"): any {
+        const a: any = fixture(name);
+        patch(a);
+        return a;
+    }
+
+    it("reads the shared fixture, leaving out the fields v1 does not define", () => {
+        const parsed: DnsProviderCredentialsV1 = parseProviderCredentials(fixture("provider-credentials"));
+        expect(parsed).toEqual({
+            apiVersion: "dns.rapidmx.io/v1",
+            kind: "DnsProviderCredentials",
+            providerUid: "cloudflare-main",
+            generation: 1,
+            values: { apiToken: "cf-example-token-not-a-real-secret" },
+        });
+        expect(parsed).not.toHaveProperty("futureField");
+        expect(parsed).not.toHaveProperty("unreadable");
+    });
+
+    it("reads the fields the server could not decrypt, by name", () => {
+        expect(parseProviderCredentials(fixture("provider-credentials-unreadable"))).toEqual({
+            apiVersion: "dns.rapidmx.io/v1",
+            kind: "DnsProviderCredentials",
+            providerUid: "aws-main",
+            generation: 2,
+            values: { accessKeyId: "AKIAEXAMPLEEXAMPLE00" },
+            unreadable: ["secretAccessKey"],
+        });
+    });
+
+    it("reads a config without credentials: generation 0 and no values", () => {
+        expect(parseProviderCredentials(answer((a) => Object.assign(a, { generation: 0, values: {} })))).toMatchObject({ generation: 0, values: {} });
+    });
+
+    it("refuses another version or kind as a version mismatch", () => {
+        expect(() => parseProviderCredentials(answer((a) => (a.apiVersion = "dns.rapidmx.io/v2")))).toThrow(ApiVersionError);
+        expect(() => parseProviderCredentials(fixture("desired-state"))).toThrow(ApiVersionError);
+    });
+
+    it.each([
+        ["providerUid", (a: any) => (a.providerUid = ""), "'providerUid' must be text"],
+        ["generation", (a: any) => (a.generation = "1"), "'generation' must be a whole number"],
+        ["generation", (a: any) => (a.generation = -1), "'generation' must be a whole number"],
+        ["values", (a: any) => (a.values = []), "'values' must be an object"],
+        ["values", (a: any) => delete a.values, "'values' must be an object"],
+        ["values", (a: any) => (a.values.apiToken = 5), "'values.apiToken' must be text"],
+        ["values", (a: any) => (a.values.apiToken = ""), "'values.apiToken' must be text"],
+        ["values", (a: any) => (a.values["bad key/"] = "x"), "'values' has a field name that is not a credential field name"],
+        ["unreadable", (a: any) => (a.unreadable = "apiToken"), "'unreadable' must be a list of text"],
+        ["unreadable", (a: any) => (a.unreadable = [""]), "'unreadable' must be a list of text"],
+    ])("refuses the whole answer when %s is malformed, naming the field, never a value", (_field, patch, message) => {
+        let err: unknown;
+        try {
+            parseProviderCredentials(answer(patch));
+        } catch (e) {
+            err = e;
+        }
+        expect(err).toBeInstanceOf(DnsApiPayloadError);
+        expect(err).toMatchObject({ name: "DnsApiPayloadError", message });
+        expect((err as Error).message).not.toContain("cf-example-token");
     });
 });

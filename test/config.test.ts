@@ -35,7 +35,7 @@ describe("loadConfig", () => {
         });
     });
 
-    it("reads the external-dns settings and the OpenBao SecretStore", () => {
+    it("reads the external-dns settings", () => {
         const pin = "registry.k8s.io/external-dns/external-dns:v0.23.0@sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
         expect(
             loadConfig({
@@ -46,9 +46,6 @@ describe("loadConfig", () => {
                 DNS_CONTROLLER_EXTERNAL_DNS_SERVICE_ACCOUNT: "dns-sa",
                 DNS_CONTROLLER_EXTERNAL_DNS_RESOURCES: '{"requests":{"cpu":"10m"},"limits":{"memory":"128Mi"}}',
                 DNS_CONTROLLER_RESYNC_MINUTES: "5",
-                DNS_CONTROLLER_OPENBAO_SECRET_STORE: "rel-rapidmx-openbao",
-                DNS_CONTROLLER_OPENBAO_PATH_PREFIX: "/rel-rapidmx/integrations/",
-                DNS_CONTROLLER_EXTERNAL_SECRETS_API_VERSION: "external-secrets.io/v1beta1",
             })
         ).toMatchObject({
             fullname: "rel-rapidmx",
@@ -57,11 +54,20 @@ describe("loadConfig", () => {
             externalDnsServiceAccount: "dns-sa",
             externalDnsResources: { requests: { cpu: "10m" }, limits: { memory: "128Mi" } },
             resyncMinutes: 5,
-            openbao: { secretStore: "rel-rapidmx-openbao", pathPrefix: "rel-rapidmx/integrations", externalSecretsApiVersion: "external-secrets.io/v1beta1" },
         });
-        expect(
-            loadConfig({ ...base, DNS_CONTROLLER_OPENBAO_SECRET_STORE: "mail-openbao", DNS_CONTROLLER_OPENBAO_PATH_PREFIX: "mail/integrations" }).openbao
-        ).toEqual({ secretStore: "mail-openbao", pathPrefix: "mail/integrations", externalSecretsApiVersion: "external-secrets.io/v1" });
+    });
+
+    it("ignores the OpenBao and External Secrets settings of the ExternalSecret path, which no longer exists", () => {
+        const config = loadConfig({
+            ...base,
+            DNS_CONTROLLER_OPENBAO_SECRET_STORE: "mail-openbao",
+            DNS_CONTROLLER_OPENBAO_PATH_PREFIX: "mail/integrations",
+            DNS_CONTROLLER_EXTERNAL_SECRETS_API_VERSION: "external-secrets.io/v1beta1",
+        });
+        expect(config).not.toHaveProperty("openbao");
+        // Not even a malformed old value stops a controller whose chart still sets them.
+        expect(() => loadConfig({ ...base, DNS_CONTROLLER_OPENBAO_SECRET_STORE: "Bad Store", DNS_CONTROLLER_EXTERNAL_SECRETS_API_VERSION: "v2" })).not.toThrow();
+        expect(loadConfig(base)).toEqual(loadConfig({ ...base, DNS_CONTROLLER_OPENBAO_PATH_PREFIX: "x" }));
     });
 
     it("reads every override", () => {
@@ -148,23 +154,6 @@ describe("loadConfig", () => {
         ["DNS_CONTROLLER_EXTERNAL_DNS_RESOURCES", { DNS_CONTROLLER_EXTERNAL_DNS_RESOURCES: "[1]" }, /must be a JSON object/],
         ["DNS_CONTROLLER_EXTERNAL_DNS_RESOURCES", { DNS_CONTROLLER_EXTERNAL_DNS_RESOURCES: "{" }, /must be a JSON object/],
         ["DNS_CONTROLLER_RESYNC_MINUTES", { DNS_CONTROLLER_RESYNC_MINUTES: "0" }, /from 1 to 1440/],
-        ["DNS_CONTROLLER_OPENBAO_SECRET_STORE", { DNS_CONTROLLER_OPENBAO_SECRET_STORE: "mail-openbao" }, /set both or neither/],
-        ["DNS_CONTROLLER_OPENBAO_PATH_PREFIX", { DNS_CONTROLLER_OPENBAO_PATH_PREFIX: "mail/integrations" }, /set both or neither/],
-        [
-            "DNS_CONTROLLER_OPENBAO_SECRET_STORE",
-            { DNS_CONTROLLER_OPENBAO_SECRET_STORE: "Bad Store", DNS_CONTROLLER_OPENBAO_PATH_PREFIX: "mail/integrations" },
-            /must be a Kubernetes name/,
-        ],
-        [
-            "DNS_CONTROLLER_OPENBAO_PATH_PREFIX",
-            { DNS_CONTROLLER_OPENBAO_SECRET_STORE: "mail-openbao", DNS_CONTROLLER_OPENBAO_PATH_PREFIX: "mail/../x" },
-            /must be a KV path/,
-        ],
-        [
-            "DNS_CONTROLLER_EXTERNAL_SECRETS_API_VERSION",
-            { DNS_CONTROLLER_OPENBAO_SECRET_STORE: "mail-openbao", DNS_CONTROLLER_OPENBAO_PATH_PREFIX: "mail/integrations", DNS_CONTROLLER_EXTERNAL_SECRETS_API_VERSION: "v2" },
-            /external-secrets.io\/v1 or external-secrets.io\/v1beta1/,
-        ],
     ])("refuses a bad %s", (_name, patch, message) => {
         expect(() => loadConfig({ ...base, ...patch })).toThrow(ConfigError);
         expect(() => loadConfig({ ...base, ...patch })).toThrow(message);

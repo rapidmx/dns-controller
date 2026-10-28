@@ -3,10 +3,10 @@
 // SPDX-License-Identifier: MPL-2.0
 ///////////////////////////////////////////////////////////////////////////////
 // The Kubernetes objects the controller writes for a desired state (spec 7.4, 7.5): per provider config, one external-dns
-// Deployment and, with OpenBao, the ExternalSecret that materializes its credentials; per endpoint set, one DNSEndpoint.
-// Pure functions: the Reconciler applies what these return. No credential value ever appears in them, only references to
-// the provider's Secret (`<fullname>-dns-<uid>`), which external-dns reads through env or a mounted file.
-import type { OpenbaoSettings } from "../config.js";
+// Deployment and the Secret holding its credentials; per endpoint set, one DNSEndpoint. Pure functions: the Reconciler
+// applies what these return. No credential value appears in a Deployment, only references to the provider's Secret
+// (`<fullname>-dns-<uid>`), which external-dns reads through env or a mounted file; the Secret is the one object that holds
+// them (`credentialsSecret()`).
 import type { DnsProviderType, DnsProviderV1, DnsRecordKind, DnsRecordV1, EndpointSetV1 } from "../api/v1.js";
 
 /** The server-side apply field manager, and the `managed-by` label of everything the controller writes. */
@@ -19,7 +19,7 @@ export const LABEL_MANAGED_BY = "app.kubernetes.io/managed-by";
 export const LABEL_PROVIDER = "rapidmx.io/dns-provider";
 export const LABEL_DOMAIN = "rapidmx.io/domain";
 export const LABEL_SECRET_KIND = "rapidmx.io/secret-kind";
-/** The `SecretRef.generation` a provider's credentials are at: on the pod template it rolls the pod when they change (5.3). */
+/** The `credentials.generation` the provider's Secret holds: on the pod template it rolls the pod when they change (7.4). */
 export const ANNOTATION_CREDENTIALS_GENERATION = "rapidmx.io/credentials-generation";
 
 /** external-dns's metrics and health port. */
@@ -46,8 +46,6 @@ export interface ManifestSettings {
     externalDnsImage: string;
     externalDnsServiceAccount: string;
     externalDnsResources?: Record<string, unknown>;
-    /** Unset without OpenBao: an OpenBao `SecretRef` then can't be materialized. */
-    openbao?: OpenbaoSettings;
 }
 
 /** A Kubernetes object as the controller writes it. */
@@ -56,6 +54,15 @@ export interface Manifest {
     kind: string;
     metadata: { name: string; namespace: string; labels: Record<string, string>; annotations?: Record<string, string> };
     spec: Record<string, unknown>;
+}
+
+/** The provider's credentials Secret: its data is base64, as the API server stores it. */
+export interface SecretManifest {
+    apiVersion: "v1";
+    kind: "Secret";
+    type: "Opaque";
+    metadata: Manifest["metadata"] & { ownerReferences: { apiVersion: string; kind: string; name: string; uid: string }[] };
+    data: Record<string, string>;
 }
 
 /** One `DNSEndpoint` entry, as external-dns's CRD names its fields. */
@@ -71,7 +78,7 @@ export function deploymentName(settings: Pick<ManifestSettings, "fullname">, pro
     return `${settings.fullname}-external-dns-${providerUid}`;
 }
 
-/** The provider's credentials Secret: written by the controller (Kubernetes backend, 5.2) or by External Secrets (OpenBao). */
+/** The provider's credentials Secret, written by the controller from the credentials the server sends it (7.3). */
 export function credentialsSecretName(settings: Pick<ManifestSettings, "fullname">, providerUid: string): string {
     return `${settings.fullname}-dns-${providerUid}`;
 }
@@ -285,9 +292,9 @@ function requiredCredentials(provider: DnsProviderV1): string[] {
     }
 }
 
-/** Why `provider` can't run (credential fields its reference lacks), or undefined. Such an instance is scaled to zero. */
+/** Why `provider` can't run (credential fields it has not saved), or undefined. Such an instance is scaled to zero. */
 export function credentialsProblem(provider: DnsProviderV1): string | undefined {
-    const keys: string[] = provider.secretRef?.keys ?? [];
+    const keys: string[] = provider.credentials?.keys ?? [];
     const missing: string[] = requiredCredentials(provider).filter((key) => !keys.includes(key));
     return missing.length > 0 ? `missing credentials: ${missing.join(", ")}` : undefined;
 }
@@ -301,7 +308,7 @@ interface CredentialWiring {
 /** How each type's credentials reach external-dns: env from the provider's Secret, or a file mounted from it. */
 function credentialWiring(provider: DnsProviderV1, settings: ManifestSettings): CredentialWiring {
     const secret: string = credentialsSecretName(settings, provider.uid);
-    const keys: string[] = provider.secretRef?.keys ?? [];
+    const keys: string[] = provider.credentials?.keys ?? [];
     const wiring: CredentialWiring = { env: [], volumes: [], volumeMounts: [] };
     const fromSecret = (name: string, key: string): void => {
         if (keys.includes(key)) {
@@ -339,8 +346,7 @@ function credentialWiring(provider: DnsProviderV1, settings: ManifestSettings): 
             }
             break;
         case "azure":
-            // azure.json is assembled in the Secret: by External Secrets' template with OpenBao (externalSecret()), by
-            // the controller's own secret write with the Kubernetes backend.
+            // azure.json is assembled by the controller when it writes the Secret (credentialsSecret()).
             if (keys.includes("clientId") || keys.includes("clientSecret")) {
                 mount(AZURE_CONFIG_DIR, "azure.json", "azure.json");
             }
@@ -405,7 +411,7 @@ export function externalDnsDeployment(
             template: {
                 metadata: {
                     labels,
-                    ...(provider.secretRef && credentialsGeneration !== undefined
+                    ...(provider.credentials && credentialsGeneration !== undefined
                         ? { annotations: { [ANNOTATION_CREDENTIALS_GENERATION]: String(credentialsGeneration) } }
                         : {}),
                 },
@@ -429,44 +435,56 @@ export function externalDnsDeployment(
 
 const GUID: RegExp = /^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$/;
 
+/** The credential fields each type reads from its Secret by name; Azure's are not among them, they go into `azure.json`. */
+const SECRET_FIELDS: Record<DnsProviderType, readonly string[]> = {
+    cloudflare: ["apiToken"],
+    route53: ["accessKeyId", "secretAccessKey"],
+    rfc2136: ["tsigSecret"],
+    google: ["serviceAccountJson"],
+    azure: [],
+};
+
+const base64 = (value: string): string => Buffer.from(value, "utf8").toString("base64");
+
 /**
- * The ExternalSecret that has External Secrets materialize the provider's Secret from OpenBao (5.2), or undefined for a
- * config whose credentials aren't in OpenBao. The Secret is labelled like the controller's own and carries the
- * reference's generation, which is also on the ExternalSecret so a new generation makes External Secrets refresh at once.
+ * The provider's Secret (7.4), the one external-dns reads its credentials from. It holds `values`, the credentials the
+ * server sent, under the field names the Deployment refers to (`credentialWiring()`); a field the type doesn't read is
+ * left out. Azure reads a single file whose tenant isn't a flag, so its Secret holds `azure.json`, built here with
+ * `JSON.stringify` from the tenant in the options (which must be exactly a GUID) and the client id and secret.
+ *
+ * The Secret is labelled like everything the controller writes, carries the generation of the credentials it holds (the
+ * Reconciler compares it with the desired one, and the pod template rolls on it) and is owned by the provider's
+ * Deployment (`ownerUid`), so it goes with it. Values are base64 data, never in a label or annotation.
  */
-export function externalSecret(provider: DnsProviderV1, settings: ManifestSettings): Manifest | undefined {
-    const ref = provider.secretRef;
-    if (ref?.backend !== "openbao") {
-        return undefined;
-    }
-    if (!settings.openbao) {
-        throw new Error("the credentials are in OpenBao, but OpenBao is not configured for the DNS controller");
-    }
-    const labels: Record<string, string> = { ...managedLabels(settings), [LABEL_PROVIDER]: provider.uid, [LABEL_SECRET_KIND]: "dns" };
-    const annotations: Record<string, string> = { [ANNOTATION_CREDENTIALS_GENERATION]: String(ref.generation) };
-    const template: Record<string, unknown> = { metadata: { labels, annotations } };
+export function credentialsSecret(provider: DnsProviderV1, values: Record<string, string>, settings: ManifestSettings, ownerUid: string): SecretManifest {
+    const data: Record<string, string> = {};
     if (provider.type === "azure") {
-        // external-dns reads Azure's credentials from one JSON file. The tenant is written into the template's text, so
-        // it must be exactly a GUID; the client's values are inserted by External Secrets, JSON-encoded.
         const tenantId: string | undefined = textOption(provider, "tenantId");
         if (!tenantId || !GUID.test(tenantId)) {
             throw new Error("'tenantId' must be a GUID");
         }
-        template.data = {
-            "azure.json": `{"tenantId":${JSON.stringify(tenantId)},"aadClientId":{{ .clientId | toJson }},"aadClientSecret":{{ .clientSecret | toJson }}}`,
-        };
+        if (values.clientId !== undefined && values.clientSecret !== undefined) {
+            data["azure.json"] = base64(JSON.stringify({ tenantId, aadClientId: values.clientId, aadClientSecret: values.clientSecret }));
+        }
     }
-    const name: string = credentialsSecretName(settings, provider.uid);
+    for (const field of SECRET_FIELDS[provider.type]) {
+        if (values[field] !== undefined) {
+            data[field] = base64(values[field]);
+        }
+    }
     return {
-        apiVersion: settings.openbao.externalSecretsApiVersion,
-        kind: "ExternalSecret",
-        metadata: { name, namespace: settings.namespace, labels, annotations },
-        spec: {
-            refreshInterval: "1h",
-            secretStoreRef: { name: settings.openbao.secretStore, kind: "SecretStore" },
-            target: { name, creationPolicy: "Owner", template },
-            data: ref.keys.map((key) => ({ secretKey: key, remoteRef: { key: `${settings.openbao?.pathPrefix}/${ref.path}`, property: key } })),
+        apiVersion: "v1",
+        kind: "Secret",
+        type: "Opaque",
+        metadata: {
+            name: credentialsSecretName(settings, provider.uid),
+            namespace: settings.namespace,
+            labels: { ...managedLabels(settings), [LABEL_PROVIDER]: provider.uid, [LABEL_SECRET_KIND]: "dns" },
+            annotations: { [ANNOTATION_CREDENTIALS_GENERATION]: String(provider.credentials?.generation) },
+            // Without `blockOwnerDeletion` or `controller`: setting either needs a right on the Deployment's finalizers.
+            ownerReferences: [{ apiVersion: "apps/v1", kind: "Deployment", name: deploymentName(settings, provider.uid), uid: ownerUid }],
         },
+        data,
     };
 }
 

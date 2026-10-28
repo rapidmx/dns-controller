@@ -19,17 +19,16 @@ The design is in `@rapidmx/restapi`'s
 
 ## Status
 
-Phase C3, first part: on top of C1 (configuration, structured logging, health endpoints, the Kubernetes REST client,
+Phase C3, in part: on top of C1 (configuration, structured logging, health endpoints, the Kubernetes REST client,
 the Lease-based single writer, the start-up handshake) and C2 (the desired-state long poll, status reports, the projected
-token on its calls), the controller reconciles the desired state into external-dns Deployments, `ExternalSecret`s and
-`DNSEndpoint`s. Its status reports don't list them yet, and the secret routes for the Kubernetes-Secret backend are still
-to come.
+token on its calls), the controller reconciles the desired state into external-dns Deployments, their credentials Secrets
+(written from the credentials the server sends it) and `DNSEndpoint`s. Its status reports don't list them yet.
 
 | Phase | Scope | State |
 | --- | --- | --- |
 | C1 | Skeleton: configuration, logging, health, Kubernetes client, Lease, `v1` types and the handshake | done |
 | C2 | Desired-state long poll, status reports, projected-token authentication on its calls | done |
-| C3 | Reconcile: external-dns Deployments, `DNSEndpoint`s, `ExternalSecret`s (done); per-provider and per-endpoint status, secret writes for the Kubernetes-Secret backend (planned) | in progress |
+| C3 | Reconcile: external-dns Deployments, their credentials Secrets, `DNSEndpoint`s (done); per-provider and per-endpoint status (planned) | in progress |
 | C4 | Takeover, credentials-test and restore Jobs | planned |
 | C5 | external-dns metrics and per-provider health | planned |
 
@@ -47,6 +46,12 @@ to come.
   change, a lower one too (the server's counter can be reset). A malformed state is refused whole and never acted on.
   A server that answers 404 or `unsupported_api_version` (rolled back underneath the controller) sends it back to the
   handshake.
+- **Credentials.** `GET <base>/v1/providers/<uid>/credentials`, only when a provider's Secret is missing, holds another
+  generation than the config's (or none) or is owned by another Deployment than the one now there, as when that was
+  deleted and recreated by hand (never on a pass that has nothing to write, and never while the controller may not
+  write). The answer's generation must be the one the desired state lists; a field the server could not decrypt is named
+  in `unreadable` and the controller keeps the Secret it has. The server sends them over its in-cluster HTTP like every
+  internal call; the controller holds them in memory only for that write and never logs them.
 - **Status.** `PUT <base>/v1/status` after every new desired-state version and every
   `DNS_CONTROLLER_STATUS_INTERVAL_SECONDS`, saying whether this pod holds the Lease: the server acts only on the
   holder's report.
@@ -66,25 +71,35 @@ and holds its Lease (checked before every write), and labelled `app.kubernetes.i
   reading only the `DNSEndpoint`s labelled `rapidmx.io/dns-provider: <uid>` with the TXT registry
   (`--txt-owner-id` from the server, `--txt-prefix=rmx-%{record_type}.`, `--policy=sync`, MX, TXT and SRV managed, but
   never MX or SRV for rfc2136), kept out of any zone another config has nested under its own (`--exclude-domains`). Its
-  credentials come only from the Secret `<fullname>-dns-<uid>`, as environment
-  variables or a mounted file, never as arguments. With OpenBao, an `ExternalSecret` of the same name has External
-  Secrets write that Secret. The pod template carries the credentials generation the Secret already holds, so new
-  credentials roll the pod once they are there.
+  credentials come only from the Secret `<fullname>-dns-<uid>`, as environment variables or a mounted file, never as
+  arguments. The pod template carries the credentials generation the Secret already holds, so new credentials roll the
+  pod once they are there.
+- **Per provider's credentials:** the Secret `<fullname>-dns-<uid>`, labelled `rapidmx.io/secret-kind: dns` and for the
+  provider, annotated `rapidmx.io/credentials-generation` with the generation it holds, and owned by the provider's
+  Deployment, so it goes with it. It holds the fields the provider type reads (`apiToken`, `accessKeyId` and
+  `secretAccessKey`, `tsigSecret`, `serviceAccountJson`); Azure's holds `azure.json`, which the controller builds from
+  the tenant in the provider's options (exactly a GUID) and the client id and secret. A fetch that fails, an answer at
+  another generation or a field that can't be decrypted leaves the Secret and the pod as they are and tries again with
+  the pass's backoff. A Secret of that name that this controller did not write is never written over (the config is
+  reported failed), and a config without credentials gets none (one the controller wrote is deleted, once the
+  Deployment no longer refers to it: not while the image is refused). Without an instance to own it (the image refused
+  and no Deployment yet) the Secret waits.
 - **Per endpoint set** (a domain's records, a provider's share of the deployment's hosts): the `DNSEndpoint`
   `<fullname>-<set id>`, TXT targets in the form the provider keeps them (quoted, long values in 255-byte strings, for
   Cloudflare, Route 53 and Google; verbatim for Azure, which keeps only one value per name; unquoted for rfc2136, which
   can't update or delete a value with a space, `;` or quote, so such a value is left out there), Cloudflare's
   A/AAAA/CNAME unproxied.
-- **Pruning:** a `DNSEndpoint` the desired state no longer has is deleted. A deleted provider's `ExternalSecret`,
-  Secret and Deployment go two minutes after its endpoints, so its instance can remove the records it owns; the Secret
-  only when its labels say it is that provider's, and the Deployment last.
+- **Pruning:** a `DNSEndpoint` the desired state no longer has is deleted. A deleted provider's Secret and Deployment go
+  two minutes after its endpoints, so its instance can remove the records it owns; the Secret only when its labels say
+  it is that provider's, and the Deployment last.
 
-A desired state with a provider config without zones, a zone in two configs, or a credentials path outside `dns/` is
-refused whole: nothing is written.
+A desired state with a provider config without zones, a zone in two configs, or a credential field name that isn't
+letters, digits, `-` and `_` is refused whole: nothing is written.
 
 It reconciles on every new desired state, when it takes the Lease, every `DNS_CONTROLLER_RESYNC_MINUTES`, and again
 (15 s, backing off to a minute) after a pass that left something undone. On shutdown it lets the pass under way finish
-its request before releasing the Lease. It reads Secrets' metadata only, never their values.
+its request before releasing the Lease. It reads Secrets' metadata only, never their values: it has them from the server
+when it writes one.
 
 ## Configuration
 
@@ -105,9 +120,6 @@ Set by the RapidMX server's Helm chart; listed here for reference and local runs
 | `DNS_CONTROLLER_EXTERNAL_DNS_SERVICE_ACCOUNT` | The ServiceAccount external-dns runs as (default `<fullname>-external-dns`) |
 | `DNS_CONTROLLER_EXTERNAL_DNS_RESOURCES` | The external-dns container's `resources`, as JSON (default none) |
 | `DNS_CONTROLLER_RESYNC_MINUTES` | How often the whole desired state is reconciled again (default `10`) |
-| `DNS_CONTROLLER_OPENBAO_SECRET_STORE` | With OpenBao: the release's `SecretStore` (`<fullname>-openbao`); set with the next one or not at all |
-| `DNS_CONTROLLER_OPENBAO_PATH_PREFIX` | With OpenBao: the integrations prefix in the KV mount (`<fullname>/integrations`) |
-| `DNS_CONTROLLER_EXTERNAL_SECRETS_API_VERSION` | `external-secrets.io/v1` (default) or `external-secrets.io/v1beta1` |
 | `DNS_CONTROLLER_LEASE_DURATION_SECONDS` | Lease duration (default `30`) |
 | `DNS_CONTROLLER_LEASE_RENEW_SECONDS` | Renew interval (default `10`; at most a third of the duration) |
 | `DNS_CONTROLLER_HEALTH_PORT` | Port of `/healthz` and `/readyz` (default `8081`) |
