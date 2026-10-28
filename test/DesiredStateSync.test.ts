@@ -357,4 +357,123 @@ describe("DesiredStateSync", () => {
         expect(s.desiredState?.version).toBe(1);
         s.stop();
     });
+
+    describe("status entries", () => {
+        const entries = {
+            providers: [{ providerUid: "cloudflare-main", readyReplicas: 1, image: "registry.k8s.io/external-dns/external-dns:v0.23.0", lastRolloutAt: "2026-10-28T08:00:00.000Z" }],
+            endpoints: [{ endpointSetId: "domain-example-com", generation: 3, observedGeneration: 3 }],
+            operations: [{ id: "op-1", state: "running" as const }],
+        };
+
+        it("puts the providers', endpoints' and operations' entries in the report of a pod that holds the Lease, read for the state it has", async () => {
+            const read = vi.fn(async (_state: DesiredStateV1) => entries);
+            holds = true;
+            const s = sync({ entries: read });
+            s.start(incompatible);
+            await tick();
+            polls[0].answer(ok(42));
+            await tick();
+            expect(read).toHaveBeenCalledTimes(1);
+            expect(read.mock.calls[0][0].version).toBe(42);
+            expect(reports).toHaveLength(1);
+            expect(reports[0]).toMatchObject({ desiredStateVersion: 42, lease: { holder: true }, ...entries });
+            s.stop();
+        });
+
+        it("reads them again for every report, so the next one carries what changed", async () => {
+            let ready = 0;
+            holds = true;
+            const s = sync({
+                statusIntervalSeconds: 10,
+                entries: async () => ({ ...entries, providers: [{ ...entries.providers[0], readyReplicas: ready++ }] }),
+            });
+            s.start(incompatible);
+            await tick();
+            polls[0].answer(ok(42));
+            await tick();
+            await tick(10000);
+            expect(reports.map((r) => r.providers[0].readyReplicas)).toEqual([0, 1]);
+            s.stop();
+        });
+
+        it("reads nothing and reports none when the pod does not hold the Lease: the server acts only on the holder's report", async () => {
+            const read = vi.fn(async () => entries);
+            const s = sync({ entries: read });
+            s.start(incompatible);
+            await tick();
+            polls[0].answer(ok(42));
+            await tick();
+            expect(read).not.toHaveBeenCalled();
+            expect(reports[0]).toMatchObject({ lease: { holder: false }, providers: [], endpoints: [], operations: [] });
+            s.stop();
+        });
+
+        it("names in a report the version its entries were read for, even when a newer state arrives while they are being read", async () => {
+            const reads: { version: number; done: (e: typeof entries) => void }[] = [];
+            holds = true;
+            const s = sync({
+                entries: (state) => new Promise((resolve) => reads.push({ version: state.version, done: resolve })),
+            });
+            s.start(incompatible);
+            await tick();
+            polls[0].answer(ok(42));
+            await tick();
+            expect(reads.map((r) => r.version)).toEqual([42]);
+            // The next state arrives while the entries of 42 are still being read.
+            await tick(1000);
+            polls[1].answer(ok(43));
+            await tick();
+            expect(s.desiredState?.version).toBe(43);
+            reads[0].done(entries);
+            await tick();
+            expect(reports.map((r) => r.desiredStateVersion)).toEqual([42]);
+            expect(reports[0]).toMatchObject(entries);
+            // The report asked for meanwhile follows, read for 43.
+            expect(reads.map((r) => r.version)).toEqual([42, 43]);
+            reads[1].done({ providers: [], endpoints: [], operations: [] });
+            await tick();
+            expect(reports.map((r) => r.desiredStateVersion)).toEqual([42, 43]);
+            s.stop();
+        });
+
+        it("sends the report without entries, and goes on reporting, when reading them throws", async () => {
+            let fail = true;
+            holds = true;
+            const s = sync({
+                statusIntervalSeconds: 10,
+                entries: async () => {
+                    if (fail) {
+                        throw new Error("a TypeError reading something");
+                    }
+                    return entries;
+                },
+            });
+            s.start(incompatible);
+            await tick();
+            polls[0].answer(ok(42));
+            await tick();
+            expect(reports).toHaveLength(1);
+            expect(reports[0]).toMatchObject({ desiredStateVersion: 42, lease: { holder: true }, providers: [], endpoints: [], operations: [] });
+            expect(logged().filter((l) => l.msg === "status_entries_failed")).toMatchObject([
+                { level: "warn", error: { name: "Error", message: "a TypeError reading something" } },
+            ]);
+            // The periodic chain was not broken by it.
+            fail = false;
+            await tick(10000);
+            expect(reports).toHaveLength(2);
+            expect(reports[1]).toMatchObject(entries);
+            s.stop();
+        });
+
+        it("reads nothing before it has a desired state to read them for", async () => {
+            const read = vi.fn(async () => entries);
+            holds = true;
+            const s = sync({ statusIntervalSeconds: 10, entries: read });
+            s.start(incompatible);
+            await tick(10000);
+            expect(read).not.toHaveBeenCalled();
+            expect(reports[0]).toMatchObject({ lease: { holder: true }, providers: [], endpoints: [], operations: [] });
+            s.stop();
+        });
+    });
 });

@@ -12,7 +12,10 @@ import { HealthServer } from "./HealthServer.js";
 import { KubeClient, type KubeTransport } from "./kube/KubeClient.js";
 import { LeaseElector } from "./kube/LeaseElector.js";
 import { Logger, stdoutSink, type LogSink } from "./log.js";
+import type { ManifestSettings } from "./reconcile/manifests.js";
+import { OperationLedger } from "./reconcile/OperationLedger.js";
 import { Reconciler } from "./reconcile/Reconciler.js";
+import { StatusCollector } from "./reconcile/StatusCollector.js";
 import { readControllerVersion } from "./version.js";
 
 export interface Overrides {
@@ -29,6 +32,8 @@ export interface Running {
     elector: LeaseElector;
     sync: DesiredStateSync;
     reconciler: Reconciler;
+    /** The results of the operations the controller runs, which its status reports carry. */
+    ledger: OperationLedger;
     healthPort: number;
     log: Logger;
     stop(): Promise<void>;
@@ -57,6 +62,8 @@ export async function startController(env: NodeJS.ProcessEnv = process.env, over
         log,
         // Holding the Lease is what lets the reconciler write: reconcile at once rather than at its next retry.
         onAcquired: () => reconciler.wake(),
+        // What the controller recorded of its operations is its to report only while it holds the Lease.
+        onLost: () => ledger.clear(),
     });
     const server = new ServerClient({
         baseUrl: config.serverUrl,
@@ -66,6 +73,17 @@ export async function startController(env: NodeJS.ProcessEnv = process.env, over
         longPollTimeoutMs: config.longPollTimeoutSeconds * 1000,
         fetch: overrides.fetch,
     });
+    const settings: ManifestSettings = {
+        namespace,
+        fullname: config.fullname,
+        release: config.release,
+        externalDnsImage: config.externalDnsImage,
+        externalDnsServiceAccount: config.externalDnsServiceAccount,
+        externalDnsResources: config.externalDnsResources,
+    };
+    // The results of the operations the controller runs, which its status reports carry.
+    const ledger = new OperationLedger();
+    const collector = new StatusCollector({ kube, settings, log, ledger });
     const sync = new DesiredStateSync({
         server,
         lease: elector,
@@ -74,7 +92,12 @@ export async function startController(env: NodeJS.ProcessEnv = process.env, over
         identity: config.holderIdentity,
         statusIntervalSeconds: config.statusIntervalSeconds,
         // The reconciler is created below, with the controller it asks before every write; nothing calls these before start().
-        onDesiredState: (state) => reconciler.update(state),
+        onDesiredState: (state) => {
+            // Pruned as a state arrives, not by the report (which may be for an older state), so a result recorded for an operation only this one lists stays.
+            ledger.retain(state.operations.map((operation) => operation.id));
+            reconciler.update(state);
+        },
+        entries: (state) => collector.collect(state),
     });
     const controller = new Controller({
         server,
@@ -88,18 +111,13 @@ export async function startController(env: NodeJS.ProcessEnv = process.env, over
         kube,
         // The credentials of a provider whose Secret has to be written come from the server.
         server,
-        settings: {
-            namespace,
-            fullname: config.fullname,
-            release: config.release,
-            externalDnsImage: config.externalDnsImage,
-            externalDnsServiceAccount: config.externalDnsServiceAccount,
-            externalDnsResources: config.externalDnsResources,
-        },
+        settings,
         // Writes only while compatible and holding the Lease, asked before every write.
         gate: controller,
         log,
         resyncMs: config.resyncMinutes * 60000,
+        // What a pass applied is reported when it ends, not only at the next interval.
+        onPass: () => void sync.report(),
     });
     const health = new HealthServer(() => controller.health());
     const healthPort: number = await health.listen(overrides.healthPort ?? config.healthPort);
@@ -112,6 +130,7 @@ export async function startController(env: NodeJS.ProcessEnv = process.env, over
         elector,
         sync,
         reconciler,
+        ledger,
         healthPort,
         log,
         async stop(): Promise<void> {

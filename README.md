@@ -19,16 +19,17 @@ The design is in `@rapidmx/restapi`'s
 
 ## Status
 
-Phase C3, in part: on top of C1 (configuration, structured logging, health endpoints, the Kubernetes REST client,
+Phase C3: on top of C1 (configuration, structured logging, health endpoints, the Kubernetes REST client,
 the Lease-based single writer, the start-up handshake) and C2 (the desired-state long poll, status reports, the projected
 token on its calls), the controller reconciles the desired state into external-dns Deployments, their credentials Secrets
-(written from the credentials the server sends it) and `DNSEndpoint`s. Its status reports don't list them yet.
+(written from the credentials the server sends it) and `DNSEndpoint`s, and its status reports list each provider's
+instance and each endpoint set.
 
 | Phase | Scope | State |
 | --- | --- | --- |
 | C1 | Skeleton: configuration, logging, health, Kubernetes client, Lease, `v1` types and the handshake | done |
 | C2 | Desired-state long poll, status reports, projected-token authentication on its calls | done |
-| C3 | Reconcile: external-dns Deployments, their credentials Secrets, `DNSEndpoint`s (done); per-provider and per-endpoint status (planned) | in progress |
+| C3 | Reconcile: external-dns Deployments, their credentials Secrets, `DNSEndpoint`s, and their entries in the status report | done |
 | C4 | Takeover, credentials-test and restore Jobs | planned |
 | C5 | external-dns metrics and per-provider health | planned |
 
@@ -54,7 +55,13 @@ token on its calls), the controller reconciles the desired state into external-d
   internal call; the controller holds them in memory only for that write and never logs them.
 - **Status.** `PUT <base>/v1/status` after every new desired-state version and every
   `DNS_CONTROLLER_STATUS_INTERVAL_SECONDS`, saying whether this pod holds the Lease: the server acts only on the
-  holder's report.
+  holder's report. The holder's also lists, read from the namespace with one list of the Deployments and one of the
+  `DNSEndpoint`s it manages: per provider the ready replicas of its Deployment, the image it runs and when it last rolled
+  out (the `Progressing` condition's last update, once the rollout completed; none while one is under way or after a
+  failed one); per endpoint set the generation of its `DNSEndpoint` and the generation external-dns has observed; and per
+  operation the result the controller holds for each one the desired state lists. A report also follows every
+  reconcile pass, so the generations applied reach the server without waiting for the next interval. A list that fails
+  leaves its entries out (`status_entries_failed`) rather than report what was not read.
 - **Authentication.** The controller presents a projected ServiceAccount token (audience `rapidmx-internal-dns`) on
   every call to the server, which verifies it. Nothing authenticates to the controller: it serves no API of its own and
   listens only on the health port, so every call goes from the controller to the server.

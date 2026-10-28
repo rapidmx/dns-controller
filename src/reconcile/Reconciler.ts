@@ -6,6 +6,7 @@ import type { ServerClient } from "../api/ServerClient.js";
 import { CREDENTIAL_FIELD, type DesiredStateV1, type DnsProviderV1, type EndpointSetV1 } from "../api/v1.js";
 import { isKubeStatus, type KubeClient } from "../kube/KubeClient.js";
 import type { Logger } from "../log.js";
+import { listManaged } from "./listManaged.js";
 import {
     acceptsExternalDnsImage,
     ANNOTATION_CREDENTIALS_GENERATION,
@@ -19,7 +20,6 @@ import {
     LABEL_MANAGED_BY,
     LABEL_PROVIDER,
     LABEL_SECRET_KIND,
-    managedLabels,
     nestedZones,
     type Manifest,
     type ManifestSettings,
@@ -41,6 +41,8 @@ export interface ReconcilerOptions {
     /** How long a deleted provider's instance outlives its endpoints, so it can delete the records it owns (one interval and a margin). */
     providerRemovalDelayMs?: number;
     now?: () => number;
+    /** Called after each pass that ran (not one refused for lack of the Lease), so the status report follows what the pass applied. Must not throw. */
+    onPass?: () => void;
 }
 
 /**
@@ -195,6 +197,9 @@ export class Reconciler {
         if (this.stopped) {
             return;
         }
+        if (outcome.result !== "not_writer") {
+            this.options.onPass?.();
+        }
         let delay: number;
         if (outcome.result === "done" || outcome.result === "refused") {
             this.retryDelayMs = this.retryMs;
@@ -241,13 +246,8 @@ export class Reconciler {
         return `${apiPrefix}/namespaces/${this.options.settings.namespace}/${resource}`;
     }
 
-    private async list(path: string): Promise<Listed[]> {
-        const selector: string = Object.entries(managedLabels(this.options.settings))
-            .map(([key, value]) => `${key}=${value}`)
-            .join(",");
-        const answer = await this.options.kube.get<{ items?: Listed[] }>(`${path}?${new URLSearchParams({ labelSelector: selector })}`);
-        // An empty list may come without `items`.
-        return answer.items ?? [];
+    private list(path: string): Promise<Listed[]> {
+        return listManaged<Listed>(this.options.kube, path, this.options.settings);
     }
 
     /**

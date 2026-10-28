@@ -6,6 +6,9 @@ import type { CallOutcome, ServerClient } from "./api/ServerClient.js";
 import { API_VERSION_V1, type DesiredStateV1, type StatusReportResultV1, type StatusReportV1 } from "./api/v1.js";
 import type { LeaseElector } from "./kube/LeaseElector.js";
 import type { Logger } from "./log.js";
+import type { StatusEntries } from "./reconcile/StatusCollector.js";
+
+const NO_ENTRIES: StatusEntries = { providers: [], endpoints: [], operations: [] };
 
 export interface DesiredStateSyncOptions {
     server: Pick<ServerClient, "desiredState" | "reportStatus">;
@@ -19,6 +22,8 @@ export interface DesiredStateSyncOptions {
     statusIntervalSeconds: number;
     /** Called with each new desired state (phase C3 reconciles it). What it throws is logged; the sync goes on. */
     onDesiredState?: (state: DesiredStateV1) => void;
+    /** The provider, endpoint and operation entries of a report, read for the desired state the controller has; asked only of the Lease holder. If it throws, the report goes out without entries (`status_entries_failed`). */
+    entries?: (state: DesiredStateV1) => Promise<StatusEntries>;
     /** Backoff while the server cannot be reached or answers with something malformed: doubles from `initial` to `max`. */
     backoffInitialMs?: number;
     backoffMaxMs?: number;
@@ -183,10 +188,21 @@ export class DesiredStateSync {
         }, this.options.statusIntervalSeconds * 1000);
     }
 
+    /** The entries of a report for `state`, or none (and a warning) when reading them fails: a rejection here would end the process, since the reports run detached. */
+    private async entries(state: DesiredStateV1): Promise<StatusEntries> {
+        try {
+            return (await this.options.entries?.(state)) ?? NO_ENTRIES;
+        } catch (err) {
+            this.options.log.warn("status_entries_failed", { error: err });
+            return NO_ENTRIES;
+        }
+    }
+
     /**
      * Sends a status report now. One asked for while another is on its way is sent once that one is answered, with
-     * what is current then. Phase C2 reports the controller itself (its version, the desired-state version it has, its
-     * Lease); the providers, endpoints and operations it applies come with phase C3.
+     * what is current then. A report says what the controller is (its version, the desired-state version it has, its
+     * Lease); that of the Lease holder also carries the providers', endpoints' and operations' entries, which the server
+     * would ignore from any other pod, so a pod without the Lease neither reads nor sends them.
      */
     async report(): Promise<void> {
         if (!this.running) {
@@ -200,15 +216,18 @@ export class DesiredStateSync {
         try {
             do {
                 this.reportAgain = false;
+                const holder: boolean = this.options.lease.holds();
+                // The state the entries are read for is the version the report names, even if a newer one arrives meanwhile
+                // (the report sent right after it corrects the server).
+                const state: DesiredStateV1 | undefined = this.current;
+                const entries: StatusEntries = holder && state ? await this.entries(state) : NO_ENTRIES;
                 const report: StatusReportV1 = {
                     apiVersion: API_VERSION_V1,
                     kind: "StatusReport",
                     controllerVersion: this.options.controllerVersion,
-                    ...(this.current ? { desiredStateVersion: this.current.version } : {}),
-                    lease: { holder: this.options.lease.holds(), identity: this.options.identity },
-                    providers: [],
-                    endpoints: [],
-                    operations: [],
+                    ...(state ? { desiredStateVersion: state.version } : {}),
+                    lease: { holder, identity: this.options.identity },
+                    ...entries,
                 };
                 const outcome: CallOutcome<StatusReportResultV1> = await this.options.server.reportStatus(report);
                 if (!this.running) {

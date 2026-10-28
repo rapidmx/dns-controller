@@ -137,15 +137,21 @@ export interface DesiredStateV1 extends V1Envelope<"DesiredState"> {
 
 export interface ProviderStatusV1 {
     providerUid: string;
+    /** The ready replicas of the provider's external-dns Deployment: 0 when it isn't there, has none yet or is disabled. */
     readyReplicas: number;
+    /** The image the Deployment runs. */
     image?: string;
+    /** When the Deployment last completed a rollout, as an ISO 8601 time; absent while one is under way or after a failed one (an additive field of v1: a server that doesn't know it leaves it out). */
+    lastRolloutAt?: string;
     lastSyncAt?: string;
     lastError?: string;
 }
 
 export interface EndpointStatusV1 {
     endpointSetId: string;
+    /** The `metadata.generation` of the `DNSEndpoint` the controller applied for the set. */
     generation: number;
+    /** The generation external-dns has read; absent until it first has. */
     observedGeneration?: number;
 }
 

@@ -285,3 +285,32 @@ first release.
   (only checked when the Deployment was applied this pass; with the image refused nothing recreates the Deployment).
 - Tests first, each failing without its fix; `yarn build` and `yarn test` pass (334 tests, 100% coverage). Spec text in
   restapi 7bd4bf3.
+
+### D3 - status entries (the rest of C3)
+
+- New `src/reconcile/StatusCollector.ts` (the entries), `OperationLedger.ts` (in-memory results of operations, fed by D4's
+  runner) and `listManaged.ts` (the label-selected list, shared with the Reconciler). `DesiredStateSync` takes an
+  `entries(state)` option, asked only of the Lease holder (the server ignores any other pod's); a pod without the Lease
+  sends just itself. One list of Deployments and one of `DNSEndpoint`s per report (Role unchanged); a failed list leaves
+  its entries out with `status_entries_failed`, never reporting what wasn't read.
+- Per provider: ready replicas (0 when the Deployment is missing, has no status or its `observedGeneration` is behind),
+  image (the `external-dns` container's), `lastRolloutAt`. Per endpoint set: `metadata.generation` and
+  `status.observedGeneration` (written when external-dns *reads* the resource); a set without a `DNSEndpoint` is left out.
+  `lastError`, `lastSyncAt` and the metrics are D5's.
+- Beyond the spec text: `lastRolloutAt?: string` is an additive optional field of the controller's `ProviderStatusV1`
+  (restapi's `DnsProviderStatus.lastRolloutAt` exists, the v1 entry had none). **Open restapi follow-up:** its
+  `ProviderStatusV1`, `parseStatusReport` and `applyProviderStatus` must carry and store it, and the shared
+  `status-report.json` fixture gains the field in both repos together; until then the console's "last rollout" stays
+  empty. Operations are plumbing only until D4 (no operation is reported `failed` for being unsupported: a finished result
+  is never reopened, so D4 could not run an operation queued meanwhile).
+- Review resolved (6 findings): a report follows every reconcile pass (`Reconciler` `onPass`, wired to `sync.report()`,
+  not after a pass refused for lack of the Lease), since the report sent as a state arrives reads the cluster before the
+  pass applied it; a report reads `this.current` once, so its entries and `desiredStateVersion` agree; `lastRolloutAt` is
+  the `Progressing` condition's last update only for status `True` and reason `NewReplicaSetAvailable` (the Deployment
+  controller also moves it during a rollout and when one fails); the ledger is pruned as a state arrives (in `index.ts`,
+  never by a report, which may be for an older state) and cleared when the Lease is lost; `entries` throwing is caught in
+  `report()` (`status_entries_failed`, report without entries), since the reports run detached.
+- **D4 preconditions:** record a result only for an operation in the latest state; the ledger is cleared on Lease loss,
+  so an operation still listed after re-acquiring is run (or its result recorded) again.
+- Tests first, each failing without its fix; `yarn build` and `yarn test` pass (374 tests, 100% coverage). The spec text
+  (7.2, 7.3, 7.4, 7.7, 18.2) went out in a separate restapi commit.

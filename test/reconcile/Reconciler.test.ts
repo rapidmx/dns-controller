@@ -872,6 +872,35 @@ describe("Reconciler", () => {
         expect(passes).toHaveBeenCalledTimes(7);
     });
 
+    it("tells its owner when a pass has ended, so the status report follows what was applied, but not when it may not write", async () => {
+        vi.useFakeTimers();
+        const onPass = vi.fn();
+        const r = reconciler({ resyncMs: 600000, retryMs: 1000, now: Date.now, onPass });
+        // Coalesced updates are one run of passes, so one call after it.
+        r.update(fixture());
+        r.update(fixture());
+        expect(onPass).not.toHaveBeenCalled();
+        await vi.advanceTimersByTimeAsync(0);
+        expect(onPass).toHaveBeenCalledTimes(1);
+        // The call comes after the objects were applied.
+        expect(kube.writes()).toContain(`APPLY ${ENDPOINT}`);
+        // A pass that ended incomplete is reported too: it applied some of it.
+        credentials = { state: "unavailable", error: "HTTP 503" };
+        kube.objects.clear();
+        await vi.advanceTimersByTimeAsync(600000);
+        expect(onPass).toHaveBeenCalledTimes(2);
+        // A pass refused for lack of the Lease changed nothing: nothing to report.
+        writable = false;
+        r.update(fixture());
+        await vi.advanceTimersByTimeAsync(0);
+        expect(onPass).toHaveBeenCalledTimes(2);
+        await r.stop();
+        // Stopped: no call.
+        r.update(fixture());
+        await vi.advanceTimersByTimeAsync(10000);
+        expect(onPass).toHaveBeenCalledTimes(2);
+    });
+
     it("tries again, with the pass's backoff, while the credentials can't be fetched", async () => {
         vi.useFakeTimers();
         credentials = { state: "unavailable", error: "HTTP 503" };

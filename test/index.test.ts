@@ -11,9 +11,19 @@ describe("startController / runMain", () => {
     let lines: string[];
     let handshakeAnswer: unknown;
     let fetchCalls: [string, RequestInit][];
+    /** The items a list of the namespace's objects answers with, by path; every other read is a 404. */
+    let listed: Record<string, unknown[]>;
+    /** The applied DNSEndpoint and the status reports, in the order they happened. */
+    let order: string[];
 
     const kubeTransport = async (request: KubeRequest): Promise<KubeResponse> => {
         kubeRequests.push(request);
+        if (request.method === "PATCH" && request.url.pathname.includes("/dnsendpoints/")) {
+            order.push("endpoint");
+        }
+        if (request.method === "GET" && listed[request.url.pathname]) {
+            return { status: 200, body: JSON.stringify({ items: listed[request.url.pathname] }) };
+        }
         if (request.method === "GET") {
             return { status: 404, body: JSON.stringify({ kind: "Status", reason: "NotFound" }) };
         }
@@ -30,6 +40,9 @@ describe("startController / runMain", () => {
     /** The server: the handshake, the desired state (a long poll that is never answered), a provider's credentials, and the status report. */
     const fakeFetch = (async (url: string, init: RequestInit) => {
         fetchCalls.push([url, init]);
+        if (url.endsWith("/v1/status")) {
+            order.push("report");
+        }
         if (url.endsWith("/handshake")) {
             return json(handshakeAnswer);
         }
@@ -63,6 +76,8 @@ describe("startController / runMain", () => {
             DNS_CONTROLLER_RELEASE: "mail",
         };
         fetchCalls = [];
+        listed = {};
+        order = [];
         kubeRequests = [];
         lines = [];
         handshakeAnswer = {
@@ -149,6 +164,68 @@ describe("startController / runMain", () => {
         // Stopping ended the long poll.
         const poll = fetchCalls.find(([url]) => url.endsWith("?since=42"));
         expect(poll[1].signal.aborted).toBe(true);
+    });
+
+    it("reports what it finds of the instances and endpoints in the namespace, once it holds the Lease", async () => {
+        listed["/apis/apps/v1/namespaces/rapidmx/deployments"] = [
+            {
+                metadata: { name: "mail-external-dns-cloudflare-main", generation: 2, labels: { "rapidmx.io/dns-provider": "cloudflare-main" } },
+                spec: { template: { spec: { containers: [{ name: "external-dns", image: "registry.k8s.io/external-dns/external-dns:v0.23.0" }] } } },
+                status: { observedGeneration: 2, readyReplicas: 1, conditions: [{ type: "Progressing", status: "True", reason: "NewReplicaSetAvailable", lastUpdateTime: "2026-10-28T08:00:00Z" }] },
+            },
+        ];
+        listed["/apis/externaldns.k8s.io/v1alpha1/namespaces/rapidmx/dnsendpoints"] = [
+            { metadata: { name: "mail-domain-example-com", generation: 4, labels: { "rapidmx.io/dns-provider": "cloudflare-main" } }, status: { observedGeneration: 3 } },
+        ];
+        const running = await startController(env, { kubeTransport, fetch: fakeFetch, sink: (l) => lines.push(l), healthPort: 0 });
+        try {
+            await waitFor(() => running.elector.holds() && running.sync.desiredState !== undefined);
+            await running.sync.report();
+            const reports = fetchCalls.filter(([url]) => url.endsWith("/v1/status")).map(([, init]) => JSON.parse(String(init.body)));
+            expect(reports[reports.length - 1]).toMatchObject({
+                lease: { holder: true },
+                providers: [
+                    { providerUid: "cloudflare-main", readyReplicas: 1, image: "registry.k8s.io/external-dns/external-dns:v0.23.0", lastRolloutAt: "2026-10-28T08:00:00.000Z" },
+                ],
+                endpoints: [{ endpointSetId: "domain-example-com", generation: 4, observedGeneration: 3 }],
+                operations: [],
+            });
+        } finally {
+            await running.stop();
+        }
+    });
+
+    it("reports again when the pass that applied the desired state ends, not only at the next interval", async () => {
+        const running = await startController(env, { kubeTransport, fetch: fakeFetch, sink: (l) => lines.push(l), healthPort: 0 });
+        try {
+            // The first report goes out as the state arrives, before anything is applied; the status interval is a minute.
+            await waitFor(() => order.includes("endpoint") && order.lastIndexOf("report") > order.indexOf("endpoint"));
+        } finally {
+            await running.stop();
+        }
+    });
+
+    it("keeps the results of the operations the desired state lists and forgets the others as it arrives, and all of them when the Lease is lost", async () => {
+        const served = desiredState.operations;
+        desiredState.operations = [{ id: "op-1", type: "test", providerUid: "cloudflare-main" }];
+        try {
+            const running = await startController(env, { kubeTransport, fetch: fakeFetch, sink: (l) => lines.push(l), healthPort: 0 });
+            try {
+                // Recorded before the state arrives (the handshake is still on its way).
+                running.ledger.record("op-1", "running");
+                running.ledger.record("op-old", "succeeded");
+                await waitFor(() => running.sync.desiredState !== undefined);
+                expect(running.ledger.get("op-1")).toEqual({ state: "running" });
+                expect(running.ledger.get("op-old")).toBeUndefined();
+                await waitFor(() => running.elector.holds());
+            } finally {
+                await running.stop();
+            }
+            // Stopping released the Lease.
+            expect(running.ledger.get("op-1")).toBeUndefined();
+        } finally {
+            desiredState.operations = served;
+        }
     });
 
     it("listens only on the health port: the controller serves no API of its own", async () => {

@@ -22,6 +22,9 @@ export const LABEL_SECRET_KIND = "rapidmx.io/secret-kind";
 /** The `credentials.generation` the provider's Secret holds: on the pod template it rolls the pod when they change (7.4). */
 export const ANNOTATION_CREDENTIALS_GENERATION = "rapidmx.io/credentials-generation";
 
+/** The name of the container an instance's Deployment runs external-dns in. */
+export const EXTERNAL_DNS_CONTAINER = "external-dns";
+
 /** external-dns's metrics and health port. */
 export const EXTERNAL_DNS_PORT = 7979;
 
@@ -382,7 +385,7 @@ export function externalDnsDeployment(
     };
     const wiring: CredentialWiring = credentialWiring(provider, settings);
     const container: Record<string, unknown> = {
-        name: "external-dns",
+        name: EXTERNAL_DNS_CONTAINER,
         image: settings.externalDnsImage,
         args: externalDnsArgs(provider, ownerId, settings.namespace, excludedZones),
         ...(wiring.env.length > 0 ? { env: wiring.env } : {}),
