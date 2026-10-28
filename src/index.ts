@@ -21,6 +21,7 @@ import { readControllerVersion } from "./version.js";
 
 export interface Overrides {
     kubeTransport?: KubeTransport;
+    /** The server's calls and the scrapes of the external-dns pods' metrics go through this. */
     fetch?: typeof fetch;
     sink?: LogSink;
     /** Listen for health checks here instead of the configured port (0: any free port). */
@@ -87,7 +88,7 @@ export async function startController(env: NodeJS.ProcessEnv = process.env, over
     };
     // The results of the operations the controller runs, which its status reports carry.
     const ledger = new OperationLedger();
-    const collector = new StatusCollector({ kube, settings, log, ledger });
+    const collector = new StatusCollector({ kube, settings, log, ledger, fetch: overrides.fetch });
     // Runs the operations the desired state lists as one-shot Jobs, at the end of each reconcile pass; a result is recorded only for an operation the newest state still lists.
     const operations = new OperationRunner({ kube, settings, log, ledger, latest: () => sync.desiredState });
     const sync = new DesiredStateSync({

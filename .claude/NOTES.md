@@ -366,3 +366,44 @@ via `ReconcilerOptions.operations`; `NotWriterError` moved to its own file for t
   - an operation the newest state no longer lists is not launched (`latest()` is asked before `launch()`).
   - `OperationRunner.forget()` clears the restore clocks when the Lease is lost (`onLost`, with the ledger).
   - `ttlSecondsAfterFinished` dropped from the Job (see above). 446 tests, 100% coverage. Spec 9.3/9.5 updated in restapi.
+
+### D5 - health (C5)
+
+Spec 7.7, "As implemented in dns-controller D5", is the reference. New `src/reconcile/ExternalDnsMetrics.ts` (pure parser of the
+Prometheus text page) and the pod scrape in `StatusCollector` (one more list, of the managed pods, after the Deployments; the
+Role already had `pods get/list`; no new setting; `fetch` and `metricsTimeoutMs` are options of the collector, `index.ts`
+passes `overrides.fetch`).
+
+- **The page is real:** `test/fixtures/external-dns/v0.23.0/metrics-synced.txt` and `metrics-provider-failing.txt` are unedited
+  `/metrics` answers of the real `registry.k8s.io/external-dns/external-dns:v0.23.0` image (docker is on this machine), run with
+  `--source=crd` against a stand-in Kubernetes API and `--provider=webhook` against a stand-in webhook (the `fake` source
+  names records at random and the `connector` source speaks gob). Re-record the same way if the pinned version moves.
+- **Metrics:** `lastSyncAt` = `external_dns_controller_last_sync_timestamp_seconds` (0 until the first sync: left out),
+  `registryErrors` = `external_dns_registry_errors_total`, `sourceErrors` = `external_dns_source_errors_total`,
+  `providerErrors` = `external_dns_controller_consecutive_soft_errors`, `ownerMismatchRecords` = the sum of
+  `external_dns_registry_skipped_records_owner_mismatch_per_sync`.
+- **Beyond the spec text:** v0.23.0 has no provider error counter. A provider that fails to list or change records is a soft
+  error: it is also counted in `registry_errors_total` and retried (any other error exits the process). Hence the consecutive
+  soft errors gauge for `providerErrors`.
+- **The owner-mismatch metric never appeared** in the real runs (a TXT owned by `someone-else`, a record without any TXT, with
+  the name desired or not; `Skipping endpoint ... because owner id does not match` is logged, the series is not exposed), though
+  its name, help text and `foreign_owner`/`record_type` labels are in the binary. So it is reported only when the page has a
+  series, never as 0 (0 would claim "no conflicts"). The parser test for the sum uses a series written by hand, and says so.
+  Worth another look with a real provider before relying on it.
+- `lastError` is set only for what the metrics prove: consecutive soft errors above 0, or every pod of the provider unreadable
+  (`ECONNREFUSED`, `timed out`, `HTTP 500`, `not an external-dns metrics page`, `page too large`). No pod, no error (ready
+  replicas say it). The failing-syncs wording carries no count (that is `providerErrors`): restapi rewrites the provider's row
+  only when its status changed, and a running count would change it on every report.
+- Pods scraped: `Running`, not terminating, labelled `external-dns` + the provider uid (an operation's pod has neither), with an
+  address `net.isIP` accepts (it goes into a URL). Side by side, 5 s timeout over the body too; the pod that synced last speaks
+  for the provider. The body is read as a stream and refused above 1 MiB (`page too large`; a real page is ~20 KB): the
+  pods run third-party code with the provider's credentials and the timeout bounds time, not bytes.
+- **Churn gate for restapi:** `applyProviderStatus` skips the row write only when the status other than `reportedAt` is
+  unchanged, and `lastSyncAt` (already stored) now moves with every sync (external-dns `--interval=1m`), so each report would
+  version-bump the DnsProvider row and 409 an admin's edit. Before D5 ships against restapi, its comparison must leave out the
+  volatile fields (`lastSyncAt`, `registryErrors`, `sourceErrors`, and `reportedAt`) so they refresh on the 5-minute cadence.
+- **Open restapi follow-up (with D3's `lastRolloutAt`):** `ProviderStatusV1`, `parseStatusReport` and `applyProviderStatus` carry
+  none of `registryErrors`, `sourceErrors`, `providerErrors`, `ownerMismatchRecords`; the shared `status-report.json` fixture is
+  unchanged (it has `lastSyncAt`) until restapi has them, then both change together.
+- Tests first (the new parser/collector/index tests failed on the missing module and options, then passed); `yarn lint`,
+  `yarn build` and `yarn test` pass (487 tests, 100% coverage) from D:. Spec text uncommitted in restapi until stage 3.

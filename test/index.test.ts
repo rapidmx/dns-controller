@@ -60,6 +60,10 @@ describe("startController / runMain", () => {
         if (url.endsWith("/v1/providers/cloudflare-main/credentials")) {
             return json(credentials);
         }
+        // An external-dns pod's metrics, scraped with the same fetch.
+        if (url === "http://10.42.0.17:7979/metrics") {
+            return new Response(readFileSync(new URL("./fixtures/external-dns/v0.23.0/metrics-synced.txt", import.meta.url), "utf8"));
+        }
         return json({ apiVersion: "dns.rapidmx.io/v1", kind: "StatusReportResult" });
     }) as unknown as typeof fetch;
 
@@ -196,6 +200,29 @@ describe("startController / runMain", () => {
                 endpoints: [{ endpointSetId: "domain-example-com", generation: 4, observedGeneration: 3 }],
                 operations: [],
             });
+        } finally {
+            await running.stop();
+        }
+    });
+
+    it("reports the metrics of a provider's external-dns pod with the rest of its entry", async () => {
+        listed["/apis/apps/v1/namespaces/rapidmx/deployments"] = [
+            { metadata: { name: "mail-external-dns-cloudflare-main", generation: 2 }, status: { observedGeneration: 2, readyReplicas: 1 } },
+        ];
+        listed["/api/v1/namespaces/rapidmx/pods"] = [
+            {
+                metadata: { name: "mail-external-dns-cloudflare-main-abc", labels: { "app.kubernetes.io/name": "external-dns", "rapidmx.io/dns-provider": "cloudflare-main" } },
+                status: { phase: "Running", podIP: "10.42.0.17" },
+            },
+        ];
+        const running = await startController(env, { kubeTransport, fetch: fakeFetch, sink: (l) => lines.push(l), healthPort: 0 });
+        try {
+            await waitFor(() => running.elector.holds() && running.sync.desiredState !== undefined);
+            await running.sync.report();
+            const reports = fetchCalls.filter(([url]) => url.endsWith("/v1/status")).map(([, init]) => JSON.parse(String(init.body)));
+            expect(reports[reports.length - 1].providers).toEqual([
+                { providerUid: "cloudflare-main", readyReplicas: 1, lastSyncAt: "2026-10-28T01:48:48.607Z", registryErrors: 0, sourceErrors: 0, providerErrors: 0 },
+            ]);
         } finally {
             await running.stop();
         }

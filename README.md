@@ -19,12 +19,13 @@ The design is in `@rapidmx/restapi`'s
 
 ## Status
 
-Phase C4: on top of C1 (configuration, structured logging, health endpoints, the Kubernetes REST client,
+Phase C5: on top of C1 (configuration, structured logging, health endpoints, the Kubernetes REST client,
 the Lease-based single writer, the start-up handshake) and C2 (the desired-state long poll, status reports, the projected
 token on its calls), the controller reconciles the desired state into external-dns Deployments, their credentials Secrets
 (written from the credentials the server sends it) and `DNSEndpoint`s, runs the operations the server queues (a
-credentials test, a takeover, a restore) as one-shot Jobs, and its status reports list each provider's instance, each
-endpoint set and each operation's result.
+credentials test, a takeover, a restore) as one-shot Jobs, and its status reports list each provider's instance (with the
+health that external-dns's own `/metrics` shows: its last sync and its error counts), each endpoint set and each
+operation's result.
 
 | Phase | Scope | State |
 | --- | --- | --- |
@@ -32,7 +33,7 @@ endpoint set and each operation's result.
 | C2 | Desired-state long poll, status reports, projected-token authentication on its calls | done |
 | C3 | Reconcile: external-dns Deployments, their credentials Secrets, `DNSEndpoint`s, and their entries in the status report | done |
 | C4 | Credentials-test, takeover and restore Jobs, and their results in the status report | done |
-| C5 | external-dns metrics and per-provider health | planned |
+| C5 | external-dns metrics and per-provider health | done |
 
 ## How it talks to the server
 

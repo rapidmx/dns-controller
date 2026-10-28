@@ -143,7 +143,13 @@ export interface ProviderStatusV1 {
     image?: string;
     /** When the Deployment last completed a rollout, as an ISO 8601 time; absent while one is under way or after a failed one (an additive field of v1: a server that doesn't know it leaves it out). */
     lastRolloutAt?: string;
+    /** The last successful sync of the provider's external-dns, as an ISO 8601 time; absent until it has synced. */
     lastSyncAt?: string;
+    /** External-dns's registry, source and provider errors and the records it skipped for an owner mismatch (additive fields of v1, from its metrics, spec 7.7; a server that doesn't know them leaves them out). */
+    registryErrors?: number;
+    sourceErrors?: number;
+    providerErrors?: number;
+    ownerMismatchRecords?: number;
     lastError?: string;
 }
 
