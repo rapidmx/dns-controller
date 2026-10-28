@@ -7,8 +7,6 @@ import { LOG_LEVELS, type LogLevel } from "./log.js";
 export const DEFAULT_SERVICE_ACCOUNT_DIR = "/var/run/secrets/kubernetes.io/serviceaccount";
 /** Where the server chart mounts the projected token with the audience `rapidmx-internal-dns`. */
 export const DEFAULT_SERVER_TOKEN_FILE = "/var/run/secrets/rapidmx/internal-dns/token";
-/** The audience of the server's projected token on its calls to the controller. */
-export const DEFAULT_API_AUDIENCE = "rapidmx-dns-controller";
 
 /** Everything the controller is configured with, read once at start-up from the environment the server chart renders. */
 export interface ControllerConfig {
@@ -24,12 +22,6 @@ export interface ControllerConfig {
     longPollTimeoutSeconds: number;
     /** How often the controller reports its status while nothing changes. */
     statusIntervalSeconds: number;
-    /** The one ServiceAccount whose token the internal API accepts: the server's, `system:serviceaccount:<namespace>:<name>`. */
-    serverSubject: string;
-    /** The audience the server's token must carry. */
-    apiAudience: string;
-    /** Port of the internal API the server calls. */
-    apiPort: number;
     /** The Kubernetes API server, from the pod's `KUBERNETES_SERVICE_HOST`/`_PORT`. */
     kubernetesHost: string;
     kubernetesPort: string;
@@ -115,14 +107,6 @@ function httpUrl(name: string, raw: string): string {
         throw new ConfigError(`${name} must be an http or https URL (got '${raw}').`);
     }
     return raw.replace(/\/+$/, "");
-}
-
-/** A ServiceAccount's token subject: both parts are Kubernetes names (lowercase letters, digits, `-` and `.`). */
-function serviceAccountSubject(name: string, raw: string): string {
-    if (!/^system:serviceaccount:[a-z0-9]([a-z0-9.-]*[a-z0-9])?:[a-z0-9]([a-z0-9.-]*[a-z0-9])?$/.test(raw)) {
-        throw new ConfigError(`${name} must be system:serviceaccount:<namespace>:<name> (got '${raw}').`);
-    }
-    return raw;
 }
 
 /** A Kubernetes object name that is also a DNS label: what every name derived from it must stay. */
@@ -213,9 +197,6 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): ControllerConf
         handshakeRetrySeconds: integer(env, "DNS_CONTROLLER_HANDSHAKE_RETRY_SECONDS", 60, 1, 3600),
         longPollTimeoutSeconds: integer(env, "DNS_CONTROLLER_LONG_POLL_TIMEOUT_SECONDS", 75, 10, 900),
         statusIntervalSeconds: integer(env, "DNS_CONTROLLER_STATUS_INTERVAL_SECONDS", 60, 5, 3600),
-        serverSubject: serviceAccountSubject("DNS_CONTROLLER_SERVER_SUBJECT", required(env, "DNS_CONTROLLER_SERVER_SUBJECT")),
-        apiAudience: optional(env, "DNS_CONTROLLER_API_AUDIENCE", DEFAULT_API_AUDIENCE),
-        apiPort: integer(env, "DNS_CONTROLLER_API_PORT", 8080, 1, 65535),
         kubernetesHost: required(env, "KUBERNETES_SERVICE_HOST"),
         kubernetesPort: optional(env, "KUBERNETES_SERVICE_PORT", "443"),
         serviceAccountDir: optional(env, "DNS_CONTROLLER_SERVICE_ACCOUNT_DIR", DEFAULT_SERVICE_ACCOUNT_DIR),

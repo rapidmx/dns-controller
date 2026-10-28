@@ -93,14 +93,14 @@ takeover/restore Jobs). Do not change these without JP:
 - **A dedicated project and image (JP, 2026-10-27),** not the server image with another command:
   this is the one RapidMX pod that can create Deployments, Secrets and Jobs, so it carries no server
   code. Image `ghcr.io/rapidmx/dns-controller:<version>`; **no Helm chart here** - the server chart
-  templates the Deployment/ServiceAccount/Role/RoleBinding/NetworkPolicy/Service and pins this
-  image's exact version (`dns.controller.image.tag`), moved in lock-step by YAML key path.
+  templates the Deployment/ServiceAccount/Role/RoleBinding and pins this image's exact version
+  (`dns.controller.image.tag`), moved in lock-step by YAML key path. No Service and no NetworkPolicy
+  admitting the server: the controller serves no API (7.2), only the health port the kubelet probes.
 - **Zero runtime dependencies.** Kubernetes REST through `node:https` with the ServiceAccount token
   (re-read every request) and the cluster CA scoped to the API server (`src/kube/KubeClient.ts`) -
   not `@kubernetes/client-node`, not global `fetch` (no per-request CA without `undici`;
   `NODE_EXTRA_CA_CERTS` would trust the cluster CA process-wide). The server's API is called with the
-  global `fetch`. JWT verification (phase C2) uses `node:crypto`. Adding a runtime dependency needs a
-  written justification here.
+  global `fetch`. Adding a runtime dependency needs a written justification here.
 - **Distroless runtime** (`gcr.io/distroless/nodejs24-debian13:nonroot`): no shell, uid 65532, only
   `dist/` and `package.json` in the image; the pod runs with a read-only root filesystem, no
   capabilities. Nothing may write to disk.
@@ -115,10 +115,10 @@ takeover/restore Jobs). Do not change these without JP:
   immediately before every Kubernetes write. Lease expiry is judged client-go style, by when this
   process last saw the record change on its own clock, never by comparing `renewTime` with the local
   clock.
-- **Namespace-scoped RBAC only**, never a ClusterRole. JWKS for token verification is fetched
-  in-cluster from `https://kubernetes.default.svc/openid/v1/jwks` (the advertised `jwks_uri` on k3s
-  is the node's public IP:6443); the default issuer-discovery binding grants it to every
-  ServiceAccount (confirmed on k3s v1.36.4).
+- **Namespace-scoped RBAC only**, never a ClusterRole.
+- **The controller serves no API (JP, 2026-10-28):** only the health port (8081) listens, and every call
+  goes from the controller to the server, which verifies the controller's projected token. Nothing
+  verifies tokens in this repo, so there is no JWKS fetch either.
 - **Never log secrets or tokens.** The logger does not filter fields.
 
 ## Session Log
@@ -243,3 +243,22 @@ providers/endpoints/operations entries and `PUT`/`DELETE /v1/secrets/:path`.
   validation, stop() draining before the Lease is released, removal order; the broad Secret `get` kept (above).
 - Verified: `yarn lint`, `yarn build`, `yarn test` (329 tests, 100% statements/branches/functions/lines) from D:;
   `tsc -p tsconfig.test.json` still has the 27 errors in untouched C2 test files.
+
+## 2026-10-28: DNS publishing and Integrations (encrypted configuration)
+
+Against the reworked spec (restapi `specs/dns_publishing_and_integrations.md`, 18.2); steps D1 to D3 come before the
+first release.
+
+### D1 - the controller's internal API removed
+
+- Deleted `src/InternalApiServer.ts` (port 8080), `src/auth/ServiceAccountTokenVerifier.ts`, the settings
+  `DNS_CONTROLLER_API_PORT`, `DNS_CONTROLLER_API_AUDIENCE` and `DNS_CONTROLLER_SERVER_SUBJECT` (the last was required, so
+  a controller no longer needs it set; the three are simply ignored if still set), their tests, the `apiPort` of
+  `startController()`'s `Running`/`Overrides` and its `started` log line, and EXPOSE 8080 in the Dockerfile. README
+  and release notes describe only the health port.
+- The C2 entry above still describes what was built; it is history. `test/helpers/ipv6.ts` stays (HealthServer's test).
+- Tests first: `config.test.ts` (the old settings ignored and absent from the config) and `index.test.ts` (nothing
+  listens on the old API port, no `apiPort`) failed, then passed after the removal.
+- Review resolved (2 findings): the stale Service/NetworkPolicy standing decision corrected; the JWKS assertion could not
+  fail (the verifier fetched keys lazily, inside `verify()`, only for a request to the API port) so it was dropped; the
+  closed-port check is the guard.

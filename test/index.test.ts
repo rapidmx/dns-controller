@@ -50,7 +50,6 @@ describe("startController / runMain", () => {
             DNS_CONTROLLER_HEALTH_PORT: "1",
             KUBERNETES_SERVICE_HOST: "10.43.0.1",
             POD_NAME: "mail-dns-controller-abc",
-            DNS_CONTROLLER_SERVER_SUBJECT: "system:serviceaccount:rapidmx:mail",
             DNS_CONTROLLER_FULLNAME: "mail",
             DNS_CONTROLLER_RELEASE: "mail",
             DNS_CONTROLLER_OPENBAO_SECRET_STORE: "mail-openbao",
@@ -82,8 +81,17 @@ describe("startController / runMain", () => {
         expect(check()).toBe(true);
     }
 
+    /** A port nothing listens on: bound and released again. */
+    async function listenFreePort(): Promise<number> {
+        const probe = await import("node:net").then((net) => net.createServer());
+        await new Promise<void>((resolve) => probe.listen(0, "0.0.0.0", resolve));
+        const free = (probe.address() as import("node:net").AddressInfo).port;
+        await new Promise((resolve) => probe.close(resolve));
+        return free;
+    }
+
     it("handshakes, takes the Lease in its namespace, reads the desired state, reports, serves health, and stops cleanly", async () => {
-        const running = await startController(env, { kubeTransport, fetch: fakeFetch, sink: (l) => lines.push(l), healthPort: 0, apiPort: 0 });
+        const running = await startController(env, { kubeTransport, fetch: fakeFetch, sink: (l) => lines.push(l), healthPort: 0 });
         try {
             expect(running.healthPort).toBeGreaterThan(0);
             await waitFor(() => running.elector.holds());
@@ -109,17 +117,12 @@ describe("startController / runMain", () => {
             const ready = await fetch(`http://127.0.0.1:${running.healthPort}/readyz`);
             expect(ready.status).toBe(200);
             expect(await ready.json()).toMatchObject({ state: "compatible", leaseHolder: true, apiVersion: "dns.rapidmx.io/v1", desiredStateVersion: 42 });
-            // The internal API refuses a call without the server's token, before anything else.
-            expect(running.apiPort).toBeGreaterThan(0);
-            const refused = await fetch(`http://127.0.0.1:${running.apiPort}/v1/secrets/x`, { method: "DELETE" });
-            expect(refused.status).toBe(403);
             const started = JSON.parse(lines[0]);
             expect(started).toMatchObject({
                 msg: "started",
                 component: "dns-controller",
                 namespace: "rapidmx",
                 identity: "mail-dns-controller-abc",
-                apiPort: running.apiPort,
             });
         } finally {
             await running.stop();
@@ -130,39 +133,28 @@ describe("startController / runMain", () => {
         expect(poll[1].signal.aborted).toBe(true);
     });
 
-    it("verifies the server's token against the cluster's keys, fetched through the Kubernetes API", async () => {
-        const running = await startController(env, { kubeTransport, fetch: fakeFetch, sink: (l) => lines.push(l), healthPort: 0, apiPort: 0 });
+    it("listens only on the health port: the controller serves no API of its own", async () => {
+        const freePort = await listenFreePort();
+        const running = await startController({ ...env, DNS_CONTROLLER_API_PORT: String(freePort) }, { kubeTransport, fetch: fakeFetch, sink: (l) => lines.push(l), healthPort: 0 });
         try {
-            const part = (value: unknown): string => Buffer.from(JSON.stringify(value)).toString("base64url");
-            const token = `${part({ alg: "RS256", kid: "k1" })}.${part({ sub: "system:serviceaccount:rapidmx:mail" })}.c2ln`;
-            const refused = await fetch(`http://127.0.0.1:${running.apiPort}/v1/secrets/x`, { method: "DELETE", headers: { Authorization: `Bearer ${token}` } });
-            expect(refused.status).toBe(403);
-            const paths = kubeRequests.map((r) => r.url.pathname);
-            expect(paths).toContain("/openid/v1/jwks");
-            expect(paths).toContain("/.well-known/openid-configuration");
+            expect(running).not.toHaveProperty("apiPort");
+            expect(JSON.parse(lines[0])).not.toHaveProperty("apiPort");
+            // Nothing took the old internal API's port.
+            await expect(fetch(`http://127.0.0.1:${freePort}/v1/secrets/x`, { method: "DELETE" })).rejects.toThrow();
         } finally {
             await running.stop();
         }
     });
 
     it("logs to stdout and listens on the configured port by default", async () => {
-        const freePort = async (): Promise<number> => {
-            const probe = await import("node:net").then((net) => net.createServer());
-            await new Promise<void>((resolve) => probe.listen(0, "0.0.0.0", resolve));
-            const free = (probe.address() as import("node:net").AddressInfo).port;
-            await new Promise((resolve) => probe.close(resolve));
-            return free;
-        };
-        const port = await freePort();
-        const apiPort = await freePort();
+        const port = await listenFreePort();
         const write = vi.spyOn(process.stdout, "write").mockImplementation(() => true);
         const running = await startController(
-            { ...env, DNS_CONTROLLER_HEALTH_PORT: String(port), DNS_CONTROLLER_API_PORT: String(apiPort) },
+            { ...env, DNS_CONTROLLER_HEALTH_PORT: String(port) },
             { kubeTransport, fetch: fakeFetch }
         );
         try {
             expect(running.healthPort).toBe(port);
-            expect(running.apiPort).toBe(apiPort);
             expect(String(write.mock.calls[0][0])).toContain('"msg":"started"');
         } finally {
             await running.stop();
@@ -195,7 +187,7 @@ describe("startController / runMain", () => {
 
     it.each(["SIGTERM", "SIGINT"])("stops and exits 0 on %s", async (signal) => {
         const exit = vi.spyOn(process, "exit").mockImplementation((() => undefined) as never);
-        await runMain(env, { kubeTransport, fetch: fakeFetch, sink: (l) => lines.push(l), healthPort: 0, apiPort: 0 });
+        await runMain(env, { kubeTransport, fetch: fakeFetch, sink: (l) => lines.push(l), healthPort: 0 });
         process.emit(signal as NodeJS.Signals, signal as NodeJS.Signals);
         await waitFor(() => exit.mock.calls.length > 0);
         expect(exit).toHaveBeenCalledWith(0);

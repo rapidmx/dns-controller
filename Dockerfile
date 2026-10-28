@@ -33,8 +33,8 @@ COPY --from=builder /app/dist ./dist
 
 ENV NODE_ENV=production
 
-# 8080: the internal API (from phase C2; only the server may reach it). 8081: /healthz and /readyz.
-EXPOSE 8080 8081
+# 8081: /healthz and /readyz, the only port the controller listens on.
+EXPOSE 8081
 
 USER nonroot
 

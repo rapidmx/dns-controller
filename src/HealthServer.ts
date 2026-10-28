@@ -14,7 +14,7 @@ export interface HealthStatus {
 
 /**
  * `/healthz` (liveness: the process and its event loop answer) and `/readyz` (readiness: the controller is not refusing
- * to act), on their own port so the probes never depend on the internal API's NetworkPolicy. GET and HEAD only.
+ * to act). The only port the controller listens on: it serves no API of its own. GET and HEAD only.
  */
 export class HealthServer {
     private readonly server: http.Server;

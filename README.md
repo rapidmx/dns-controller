@@ -20,15 +20,15 @@ The design is in `@rapidmx/restapi`'s
 ## Status
 
 Phase C3, first part: on top of C1 (configuration, structured logging, health endpoints, the Kubernetes REST client,
-the Lease-based single writer, the start-up handshake) and C2 (the desired-state long poll, status reports, authentication
-both ways), the controller reconciles the desired state into external-dns Deployments, `ExternalSecret`s and
+the Lease-based single writer, the start-up handshake) and C2 (the desired-state long poll, status reports, the projected
+token on its calls), the controller reconciles the desired state into external-dns Deployments, `ExternalSecret`s and
 `DNSEndpoint`s. Its status reports don't list them yet, and the secret routes for the Kubernetes-Secret backend are still
 to come.
 
 | Phase | Scope | State |
 | --- | --- | --- |
 | C1 | Skeleton: configuration, logging, health, Kubernetes client, Lease, `v1` types and the handshake | done |
-| C2 | Desired-state long poll, status reports, projected-token authentication both ways | done |
+| C2 | Desired-state long poll, status reports, projected-token authentication on its calls | done |
 | C3 | Reconcile: external-dns Deployments, `DNSEndpoint`s, `ExternalSecret`s (done); per-provider and per-endpoint status, secret writes for the Kubernetes-Secret backend (planned) | in progress |
 | C4 | Takeover, credentials-test and restore Jobs | planned |
 | C5 | external-dns metrics and per-provider health | planned |
@@ -50,13 +50,9 @@ to come.
 - **Status.** `PUT <base>/v1/status` after every new desired-state version and every
   `DNS_CONTROLLER_STATUS_INTERVAL_SECONDS`, saying whether this pod holds the Lease: the server acts only on the
   holder's report.
-- **Authentication.** Projected ServiceAccount tokens with dedicated audiences in both directions, no shared secrets.
-  The controller presents its token (audience `rapidmx-internal-dns`) on every call. On its internal API
-  (`DNS_CONTROLLER_API_PORT`) it accepts only the server's token: audience `rapidmx-dns-controller`, verified with
-  `node:crypto` against the cluster's service-account keys, fetched in-cluster from the API server
-  (`/openid/v1/jwks`, `/.well-known/openid-configuration`; the advertised `jwks_uri` is never used), and the exact
-  subject `DNS_CONTROLLER_SERVER_SUBJECT`. Every refusal is the same 403. The internal API serves nothing while the
-  controller may not write (incompatible, or not holding the Lease); its routes arrive with C3.
+- **Authentication.** The controller presents a projected ServiceAccount token (audience `rapidmx-internal-dns`) on
+  every call to the server, which verifies it. Nothing authenticates to the controller: it serves no API of its own and
+  listens only on the health port, so every call goes from the controller to the server.
 
 ## What it writes
 
@@ -102,9 +98,6 @@ Set by the RapidMX server's Helm chart; listed here for reference and local runs
 | `DNS_CONTROLLER_HANDSHAKE_RETRY_SECONDS` | Wait before asking again after an incompatible answer (default `60`) |
 | `DNS_CONTROLLER_LONG_POLL_TIMEOUT_SECONDS` | Timeout of one desired-state long poll (default `75`; longer than the server's `mail:dns:desired_state:long_poll_seconds`, 55) |
 | `DNS_CONTROLLER_STATUS_INTERVAL_SECONDS` | How often to report status while nothing changes (default `60`) |
-| `DNS_CONTROLLER_SERVER_SUBJECT` | **Required.** The only token subject the internal API accepts: the server's ServiceAccount, `system:serviceaccount:<namespace>:<release>` |
-| `DNS_CONTROLLER_API_AUDIENCE` | The audience the server's token must carry (default `rapidmx-dns-controller`) |
-| `DNS_CONTROLLER_API_PORT` | Port of the internal API the server calls (default `8080`) |
 | `DNS_CONTROLLER_LEASE_NAME` | **Required.** The Lease that makes this the single writer (`<release>-dns-controller`) |
 | `DNS_CONTROLLER_FULLNAME` | **Required.** The server release's full name, which names every object the controller writes |
 | `DNS_CONTROLLER_RELEASE` | **Required.** The Helm release, the `app.kubernetes.io/instance` label of those objects |
