@@ -14,6 +14,7 @@ import { LeaseElector } from "./kube/LeaseElector.js";
 import { Logger, stdoutSink, type LogSink } from "./log.js";
 import type { ManifestSettings } from "./reconcile/manifests.js";
 import { OperationLedger } from "./reconcile/OperationLedger.js";
+import { OperationRunner } from "./reconcile/OperationRunner.js";
 import { Reconciler } from "./reconcile/Reconciler.js";
 import { StatusCollector } from "./reconcile/StatusCollector.js";
 import { readControllerVersion } from "./version.js";
@@ -62,8 +63,11 @@ export async function startController(env: NodeJS.ProcessEnv = process.env, over
         log,
         // Holding the Lease is what lets the reconciler write: reconcile at once rather than at its next retry.
         onAcquired: () => reconciler.wake(),
-        // What the controller recorded of its operations is its to report only while it holds the Lease.
-        onLost: () => ledger.clear(),
+        // What the controller recorded of its operations, and what its restores have waited for, is its own only while it holds the Lease.
+        onLost: () => {
+            ledger.clear();
+            operations.forget();
+        },
     });
     const server = new ServerClient({
         baseUrl: config.serverUrl,
@@ -84,6 +88,8 @@ export async function startController(env: NodeJS.ProcessEnv = process.env, over
     // The results of the operations the controller runs, which its status reports carry.
     const ledger = new OperationLedger();
     const collector = new StatusCollector({ kube, settings, log, ledger });
+    // Runs the operations the desired state lists as one-shot Jobs, at the end of each reconcile pass; a result is recorded only for an operation the newest state still lists.
+    const operations = new OperationRunner({ kube, settings, log, ledger, latest: () => sync.desiredState });
     const sync = new DesiredStateSync({
         server,
         lease: elector,
@@ -112,6 +118,7 @@ export async function startController(env: NodeJS.ProcessEnv = process.env, over
         // The credentials of a provider whose Secret has to be written come from the server.
         server,
         settings,
+        operations,
         // Writes only while compatible and holding the Lease, asked before every write.
         gate: controller,
         log,

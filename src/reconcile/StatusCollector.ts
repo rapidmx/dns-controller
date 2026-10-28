@@ -26,7 +26,7 @@ export interface StatusCollectorOptions {
 }
 
 /** An external-dns Deployment as a list returns it; every field is optional because the API server's answer is only read, never trusted. */
-interface ListedDeployment {
+export interface ListedDeployment {
     metadata?: { name?: string; generation?: number };
     spec?: { template?: { spec?: { containers?: { name?: string; image?: unknown }[] } } };
     status?: { observedGeneration?: number; readyReplicas?: unknown; conditions?: { type?: string; status?: unknown; reason?: unknown; lastUpdateTime?: unknown }[] };
@@ -40,6 +40,13 @@ interface ListedEndpoint {
 
 function isCount(value: unknown): value is number {
     return typeof value === "number" && Number.isSafeInteger(value) && value >= 0;
+}
+
+/** The ready replicas the Deployment's status says, unless that status is of an older spec than the Deployment's now (or it isn't there). */
+export function readyReplicas(deployment: ListedDeployment | undefined): number {
+    const status: ListedDeployment["status"] = deployment?.status;
+    const stale: boolean = (status?.observedGeneration ?? 0) < (deployment?.metadata?.generation ?? 0);
+    return !stale && isCount(status?.readyReplicas) ? status.readyReplicas : 0;
 }
 
 /**
@@ -92,7 +99,7 @@ export class StatusCollector {
         const byName: Map<string | undefined, ListedDeployment> = new Map(listed.map((d) => [d.metadata?.name, d]));
         return state.providers.map((provider) => {
             const deployment: ListedDeployment | undefined = byName.get(deploymentName(settings, provider.uid));
-            const entry: ProviderStatusV1 = { providerUid: provider.uid, readyReplicas: this.readyReplicas(deployment) };
+            const entry: ProviderStatusV1 = { providerUid: provider.uid, readyReplicas: readyReplicas(deployment) };
             const image: unknown = deployment?.spec?.template?.spec?.containers?.find((c) => c.name === EXTERNAL_DNS_CONTAINER)?.image;
             if (typeof image === "string") {
                 entry.image = image;
@@ -104,13 +111,6 @@ export class StatusCollector {
             }
             return entry;
         });
-    }
-
-    /** The ready replicas the Deployment's status says, unless that status is of an older spec than the Deployment's now. */
-    private readyReplicas(deployment: ListedDeployment | undefined): number {
-        const status: ListedDeployment["status"] = deployment?.status;
-        const stale: boolean = (status?.observedGeneration ?? 0) < (deployment?.metadata?.generation ?? 0);
-        return !stale && isCount(status?.readyReplicas) ? status.readyReplicas : 0;
     }
 
     private async endpoints(state: DesiredStateV1): Promise<EndpointStatusV1[]> {

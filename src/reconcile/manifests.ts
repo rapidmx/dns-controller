@@ -6,8 +6,10 @@
 // Deployment and the Secret holding its credentials; per endpoint set, one DNSEndpoint. Pure functions: the Reconciler
 // applies what these return. No credential value appears in a Deployment, only references to the provider's Secret
 // (`<fullname>-dns-<uid>`), which external-dns reads through env or a mounted file; the Secret is the one object that holds
-// them (`credentialsSecret()`).
-import type { DnsProviderType, DnsProviderV1, DnsRecordKind, DnsRecordV1, EndpointSetV1 } from "../api/v1.js";
+// them (`credentialsSecret()`). Per queued operation (phase C4), one one-shot Job and, for a takeover or a restore, the
+// temporary DNSEndpoint it reads (`operationJob()`, `operationEndpoint()`).
+import { createHash } from "node:crypto";
+import type { DnsProviderType, DnsProviderV1, DnsRecordKind, DnsRecordV1, EndpointSetV1, OperationV1 } from "../api/v1.js";
 
 /** The server-side apply field manager, and the `managed-by` label of everything the controller writes. */
 export const FIELD_MANAGER = "rapidmx-dns-controller";
@@ -19,6 +21,10 @@ export const LABEL_MANAGED_BY = "app.kubernetes.io/managed-by";
 export const LABEL_PROVIDER = "rapidmx.io/dns-provider";
 export const LABEL_DOMAIN = "rapidmx.io/domain";
 export const LABEL_SECRET_KIND = "rapidmx.io/secret-kind";
+/** What an operation's Job selects its temporary DNSEndpoint by (a hash of the operation id), instead of the provider label an instance selects by. */
+export const LABEL_OPERATION = "rapidmx.io/dns-operation";
+/** The operation's id on its Job, for whoever reads the Job. */
+export const ANNOTATION_OPERATION = "rapidmx.io/dns-operation-id";
 /** The `credentials.generation` the provider's Secret holds: on the pod template it rolls the pod when they change (7.4). */
 export const ANNOTATION_CREDENTIALS_GENERATION = "rapidmx.io/credentials-generation";
 
@@ -77,6 +83,9 @@ export interface DnsEndpointEntry {
     providerSpecific?: { name: string; value: string }[];
 }
 
+/** An endpoint set id: a DNS label-like suffix of at most 180 characters, so `<fullname>-<id>` stays a valid name. */
+export const ENDPOINT_SET_ID: RegExp = /^[a-z0-9]([a-z0-9-]{0,178}[a-z0-9])?$/;
+
 export function deploymentName(settings: Pick<ManifestSettings, "fullname">, providerUid: string): string {
     return `${settings.fullname}-external-dns-${providerUid}`;
 }
@@ -91,9 +100,27 @@ export function dnsEndpointName(settings: Pick<ManifestSettings, "fullname">, en
     return `${settings.fullname}-${endpointSetId}`;
 }
 
+/** The hash of an operation id that stands for it in names and label values, which an id of any shape can't safely be. */
+function operationHash(operationId: string): string {
+    return createHash("sha256").update(operationId).digest("hex").slice(0, 16);
+}
+
+/**
+ * The name of an operation's Job and of its temporary DNSEndpoint: the release's name and a hash of the operation id. A
+ * Job's name is at most 63 characters (its pods carry it as a label value), so a long release name is cut.
+ */
+export function operationName(settings: Pick<ManifestSettings, "fullname">, operationId: string): string {
+    return `${settings.fullname.slice(0, 40).replace(/-+$/, "")}-op-${operationHash(operationId)}`;
+}
+
 /** The labels of every object this controller writes for this release: what its lists select. */
 export function managedLabels(settings: Pick<ManifestSettings, "release">): Record<string, string> {
     return { [LABEL_MANAGED_BY]: FIELD_MANAGER, [LABEL_INSTANCE]: settings.release };
+}
+
+/** Whether a Secret's labels say this controller wrote it for provider `uid` (the same test before any change, delete or run). */
+export function isOurSecret(labels: Record<string, string> | undefined, uid: string): boolean {
+    return labels?.[LABEL_MANAGED_BY] === FIELD_MANAGER && labels[LABEL_SECRET_KIND] === "dns" && labels[LABEL_PROVIDER] === uid;
 }
 
 /**
@@ -248,20 +275,27 @@ export function nestedZones(provider: DnsProviderV1, providers: DnsProviderV1[])
     return nested;
 }
 
+/** The arguments that select what external-dns acts on, which an instance and an operation's Job share: the source, `labelFilter`, the provider and its zones, kept out of `excludedZones`. */
+function selectionArgs(provider: DnsProviderV1, labelFilter: string, namespace: string, excludedZones: string[]): string[] {
+    return [
+        "--source=crd",
+        "--crd-source-apiversion=externaldns.k8s.io/v1alpha1",
+        "--crd-source-kind=DNSEndpoint",
+        `--namespace=${namespace}`,
+        `--label-filter=${labelFilter}`,
+        `--provider=${EXTERNAL_DNS_PROVIDERS[provider.type]}`,
+        ...provider.zones.map((zone) => `--domain-filter=${zone}`),
+        ...excludedZones.map((zone) => `--exclude-domains=${zone}`),
+    ];
+}
+
 /**
  * external-dns v0.23.0's arguments for `provider` (spec 7.4), kept out of `excludedZones` (`nestedZones()`). Credentials
  * are never among them.
  */
 export function externalDnsArgs(provider: DnsProviderV1, ownerId: string, namespace: string, excludedZones: string[] = []): string[] {
     return [
-        "--source=crd",
-        "--crd-source-apiversion=externaldns.k8s.io/v1alpha1",
-        "--crd-source-kind=DNSEndpoint",
-        `--namespace=${namespace}`,
-        `--label-filter=${LABEL_PROVIDER}=${provider.uid}`,
-        `--provider=${EXTERNAL_DNS_PROVIDERS[provider.type]}`,
-        ...provider.zones.map((zone) => `--domain-filter=${zone}`),
-        ...excludedZones.map((zone) => `--exclude-domains=${zone}`),
+        ...selectionArgs(provider, `${LABEL_PROVIDER}=${provider.uid}`, namespace, excludedZones),
         "--registry=txt",
         `--txt-owner-id=${ownerId}`,
         // With the record type and a trailing dot, an apex record's ownership TXT stays inside the zone and never sits
@@ -274,6 +308,25 @@ export function externalDnsArgs(provider: DnsProviderV1, ownerId: string, namesp
         "--events",
         "--log-format=json",
         `--metrics-address=:${EXTERNAL_DNS_PORT}`,
+        ...providerArgs(provider),
+    ];
+}
+
+/**
+ * external-dns's arguments for an operation's one-shot Job (spec 9.3): the noop registry, which treats every record as its
+ * own, and `--policy=upsert-only`, so the Job writes what its temporary endpoint holds and deletes nothing; `--once`;
+ * and the dedicated label filter, which selects that endpoint alone. A credentials test adds `--dry-run`. No owner id,
+ * no TXT prefix and no `--events`: nothing is registered, and the Job's ServiceAccount (the instances') can't create events.
+ */
+function operationArgs(operation: OperationV1, provider: DnsProviderV1, namespace: string, excludedZones: string[]): string[] {
+    return [
+        ...selectionArgs(provider, `${LABEL_OPERATION}=${operationHash(operation.id)}`, namespace, excludedZones),
+        "--registry=noop",
+        "--policy=upsert-only",
+        ...managedRecordKinds(provider.type).map((kind) => `--managed-record-types=${kind}`),
+        "--once",
+        ...(operation.type === "test" ? ["--dry-run"] : []),
+        "--log-format=json",
         ...providerArgs(provider),
     ];
 }
@@ -364,6 +417,43 @@ function instanceSelector(provider: DnsProviderV1, settings: ManifestSettings): 
 }
 
 /**
+ * The external-dns container of an instance or an operation's Job: the pinned image with `args`, the credentials by
+ * reference, and the hardening (read-only root filesystem, no capabilities).
+ */
+function externalDnsContainer(settings: ManifestSettings, args: string[], wiring: CredentialWiring): Record<string, unknown> {
+    return {
+        name: EXTERNAL_DNS_CONTAINER,
+        image: settings.externalDnsImage,
+        args,
+        ...(wiring.env.length > 0 ? { env: wiring.env } : {}),
+        ...(settings.externalDnsResources ? { resources: settings.externalDnsResources } : {}),
+        securityContext: {
+            allowPrivilegeEscalation: false,
+            readOnlyRootFilesystem: true,
+            runAsNonRoot: true,
+            capabilities: { drop: ["ALL"] },
+        },
+        ...(wiring.volumeMounts.length > 0 ? { volumeMounts: wiring.volumeMounts } : {}),
+    };
+}
+
+/** The pod spec around `container`: the instances' ServiceAccount and the pod hardened like the controller's (external-dns's image runs as the distroless nonroot user). */
+function externalDnsPodSpec(settings: ManifestSettings, container: Record<string, unknown>, wiring: CredentialWiring): Record<string, unknown> {
+    return {
+        serviceAccountName: settings.externalDnsServiceAccount,
+        securityContext: {
+            runAsNonRoot: true,
+            runAsUser: 65532,
+            runAsGroup: 65532,
+            fsGroup: 65532,
+            seccompProfile: { type: "RuntimeDefault" },
+        },
+        containers: [container],
+        ...(wiring.volumes.length > 0 ? { volumes: wiring.volumes } : {}),
+    };
+}
+
+/**
  * The provider's external-dns Deployment (7.4): one replica (none while disabled or without its credentials),
  * `Recreate` since external-dns has no leader election, the pinned image, and the pod hardened like the controller's.
  * `credentialsGeneration` goes on the pod template, so new credentials roll the pod; `excludedZones` are the nested zones
@@ -385,21 +475,10 @@ export function externalDnsDeployment(
     };
     const wiring: CredentialWiring = credentialWiring(provider, settings);
     const container: Record<string, unknown> = {
-        name: EXTERNAL_DNS_CONTAINER,
-        image: settings.externalDnsImage,
-        args: externalDnsArgs(provider, ownerId, settings.namespace, excludedZones),
-        ...(wiring.env.length > 0 ? { env: wiring.env } : {}),
+        ...externalDnsContainer(settings, externalDnsArgs(provider, ownerId, settings.namespace, excludedZones), wiring),
         ports: [{ name: "http", containerPort: EXTERNAL_DNS_PORT, protocol: "TCP" }],
         livenessProbe: { httpGet: { path: "/healthz", port: "http" }, initialDelaySeconds: 10, periodSeconds: 10, timeoutSeconds: 5, failureThreshold: 3 },
         readinessProbe: { httpGet: { path: "/healthz", port: "http" }, periodSeconds: 10, timeoutSeconds: 5 },
-        ...(settings.externalDnsResources ? { resources: settings.externalDnsResources } : {}),
-        securityContext: {
-            allowPrivilegeEscalation: false,
-            readOnlyRootFilesystem: true,
-            runAsNonRoot: true,
-            capabilities: { drop: ["ALL"] },
-        },
-        ...(wiring.volumeMounts.length > 0 ? { volumeMounts: wiring.volumeMounts } : {}),
     };
     const runs: boolean = provider.enabled && credentialsProblem(provider) === undefined;
     return {
@@ -418,19 +497,47 @@ export function externalDnsDeployment(
                         ? { annotations: { [ANNOTATION_CREDENTIALS_GENERATION]: String(credentialsGeneration) } }
                         : {}),
                 },
-                spec: {
-                    serviceAccountName: settings.externalDnsServiceAccount,
-                    // external-dns's image runs as the distroless nonroot user.
-                    securityContext: {
-                        runAsNonRoot: true,
-                        runAsUser: 65532,
-                        runAsGroup: 65532,
-                        fsGroup: 65532,
-                        seccompProfile: { type: "RuntimeDefault" },
-                    },
-                    containers: [container],
-                    ...(wiring.volumes.length > 0 ? { volumes: wiring.volumes } : {}),
-                },
+                spec: externalDnsPodSpec(settings, container, wiring),
+            },
+        },
+    };
+}
+
+/** How long an operation's Job may run before Kubernetes fails it: a pod stuck on a missing Secret, or a provider that never answers. */
+const OPERATION_DEADLINE_SECONDS = 300;
+
+/**
+ * The one-shot Job of an operation (spec 9.3, 9.5): external-dns from the pinned image with the provider's credentials and
+ * arguments, the noop registry, `--policy=upsert-only` and `--once` (`--dry-run` too for a credentials test), selecting
+ * only the operation's temporary DNSEndpoint (`operationEndpoint()`) by its own label. It fails rather than retries
+ * (`backoffLimit: 0`): an operation is the admin's to repeat, and the failure is what is reported back. Its pod carries
+ * neither the instances' labels nor the provider label, so no instance's Deployment selects it, and the container's
+ * last log lines become the pod's termination message when it fails, which is the reason reported.
+ *
+ * It has no `ttlSecondsAfterFinished`: the Job is the durable record of the result, so it stays until the controller deletes it
+ * (once the server stops listing the operation); a TTL would let a result the server has not yet taken be lost and the
+ * operation run again.
+ *
+ * Created with POST, never applied: the controller's Role has `create`, `get`, `list` and `delete` on Jobs (7.6).
+ */
+export function operationJob(operation: OperationV1, provider: DnsProviderV1, settings: ManifestSettings, excludedZones: string[] = []): Manifest {
+    const hash: string = operationHash(operation.id);
+    const labels: Record<string, string> = { ...managedLabels(settings), [LABEL_OPERATION]: hash };
+    const wiring: CredentialWiring = credentialWiring(provider, settings);
+    const container: Record<string, unknown> = {
+        ...externalDnsContainer(settings, operationArgs(operation, provider, settings.namespace, excludedZones), wiring),
+        terminationMessagePolicy: "FallbackToLogsOnError",
+    };
+    return {
+        apiVersion: "batch/v1",
+        kind: "Job",
+        metadata: { name: operationName(settings, operation.id), namespace: settings.namespace, labels, annotations: { [ANNOTATION_OPERATION]: operation.id } },
+        spec: {
+            backoffLimit: 0,
+            activeDeadlineSeconds: OPERATION_DEADLINE_SECONDS,
+            template: {
+                metadata: { labels: { [LABEL_NAME]: "external-dns-operation", ...labels } },
+                spec: { restartPolicy: "Never", ...externalDnsPodSpec(settings, container, wiring) },
             },
         },
     };
@@ -524,18 +631,58 @@ export function dnsEndpoint(set: EndpointSetV1, providerType: DnsProviderType, s
     if (set.domainUid !== undefined && LABEL_VALUE.test(set.domainUid)) {
         labels[LABEL_DOMAIN] = set.domainUid;
     }
-    const kinds: DnsRecordKind[] = managedRecordKinds(providerType);
-    const endpoints: DnsEndpointEntry[] = [];
-    for (const record of set.records.filter((r) => kinds.includes(r.recordType))) {
-        const entry: DnsEndpointEntry | undefined = endpointEntry(record, providerType);
+    return {
+        apiVersion: "externaldns.k8s.io/v1alpha1",
+        kind: "DNSEndpoint",
+        metadata: { name: dnsEndpointName(settings, set.id), namespace: settings.namespace, labels },
+        spec: { endpoints: endpointEntries(set.records, providerType) },
+    };
+}
+
+/** `records` as the DNSEndpoint entries `type`'s provider keeps, in order; what it can't keep is left out. */
+export function endpointEntries(records: DnsRecordV1[], type: DnsProviderType): DnsEndpointEntry[] {
+    const kinds: DnsRecordKind[] = managedRecordKinds(type);
+    const entries: DnsEndpointEntry[] = [];
+    for (const record of records.filter((r) => kinds.includes(r.recordType))) {
+        const entry: DnsEndpointEntry | undefined = endpointEntry(record, type);
         if (entry) {
-            endpoints.push(entry);
+            entries.push(entry);
+        }
+    }
+    return entries;
+}
+
+/**
+ * The temporary DNSEndpoint an operation's Job reads (spec 9.3, 9.5), labelled for the Job's own label filter and not for
+ * any instance's, so only the Job sees it. Holds the operation's records in the provider's form, exactly as the regular
+ * endpoint would; and, for a takeover, the ownership record of each name and type (`ownershipEndpoint()`) that the TXT
+ * registry would have written, naming the **regular** endpoint of the set as its resource and without a TTL, so that the
+ * regular instance finds the records its own and nothing to change. A restore writes none: its values go back unowned.
+ */
+export function operationEndpoint(operation: OperationV1, providerType: DnsProviderType, ownerId: string, settings: ManifestSettings): Manifest {
+    const endpoints: DnsEndpointEntry[] = endpointEntries(operation.records ?? [], providerType);
+    if (operation.type === "takeover") {
+        if (!operation.endpointSetId) {
+            throw new Error("a takeover needs the endpoint set it takes records over for");
+        }
+        const regular: string = dnsEndpointName(settings, operation.endpointSetId);
+        const owned: Set<string> = new Set();
+        for (const entry of [...endpoints]) {
+            const key = `${entry.recordType} ${entry.dnsName}`;
+            if (!owned.has(key)) {
+                owned.add(key);
+                endpoints.push(ownershipEndpoint(entry, ownerId, settings.namespace, regular));
+            }
         }
     }
     return {
         apiVersion: "externaldns.k8s.io/v1alpha1",
         kind: "DNSEndpoint",
-        metadata: { name: dnsEndpointName(settings, set.id), namespace: settings.namespace, labels },
+        metadata: {
+            name: operationName(settings, operation.id),
+            namespace: settings.namespace,
+            labels: { ...managedLabels(settings), [LABEL_OPERATION]: operationHash(operation.id) },
+        },
         spec: { endpoints },
     };
 }

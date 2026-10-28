@@ -19,18 +19,19 @@ The design is in `@rapidmx/restapi`'s
 
 ## Status
 
-Phase C3: on top of C1 (configuration, structured logging, health endpoints, the Kubernetes REST client,
+Phase C4: on top of C1 (configuration, structured logging, health endpoints, the Kubernetes REST client,
 the Lease-based single writer, the start-up handshake) and C2 (the desired-state long poll, status reports, the projected
 token on its calls), the controller reconciles the desired state into external-dns Deployments, their credentials Secrets
-(written from the credentials the server sends it) and `DNSEndpoint`s, and its status reports list each provider's
-instance and each endpoint set.
+(written from the credentials the server sends it) and `DNSEndpoint`s, runs the operations the server queues (a
+credentials test, a takeover, a restore) as one-shot Jobs, and its status reports list each provider's instance, each
+endpoint set and each operation's result.
 
 | Phase | Scope | State |
 | --- | --- | --- |
 | C1 | Skeleton: configuration, logging, health, Kubernetes client, Lease, `v1` types and the handshake | done |
 | C2 | Desired-state long poll, status reports, projected-token authentication on its calls | done |
 | C3 | Reconcile: external-dns Deployments, their credentials Secrets, `DNSEndpoint`s, and their entries in the status report | done |
-| C4 | Takeover, credentials-test and restore Jobs | planned |
+| C4 | Credentials-test, takeover and restore Jobs, and their results in the status report | done |
 | C5 | external-dns metrics and per-provider health | planned |
 
 ## How it talks to the server
@@ -96,7 +97,27 @@ and holds its Lease (checked before every write), and labelled `app.kubernetes.i
   Cloudflare, Route 53 and Google; verbatim for Azure, which keeps only one value per name; unquoted for rfc2136, which
   can't update or delete a value with a space, `;` or quote, so such a value is left out there), Cloudflare's
   A/AAAA/CNAME unproxied.
-- **Pruning:** a `DNSEndpoint` the desired state no longer has is deleted. A deleted provider's Secret and Deployment go
+- **Per operation** the desired state lists (a credentials test, a takeover, a restore), once the pass has applied and
+  pruned everything else: a one-shot `Job` `<fullname>-op-<hash of the operation id>` running external-dns from the same
+  pinned image with the provider's credentials and arguments, `--once`, selecting only its own temporary `DNSEndpoint`
+  (`rapidmx.io/dns-operation`, not the provider label the instances select by) and reading it with the noop registry and
+  `--policy=upsert-only`, which treats every record as its own and deletes nothing. A **test** is `--dry-run`: it lists
+  the zones and so proves the credentials. A **takeover** writes the operation's records and the ownership record the TXT
+  registry would have written for each (`rmx-<type>.<name>`, naming the regular endpoint, no TTL), so the regular instance
+  then owns them; it starts only once the regular endpoint holds those records, or the regular instance would delete what
+  it finds owned and unwanted, and it is also the way to create an MX where an unowned TXT set at the apex blocks the
+  creation. A **restore** writes only the SPF and the kept values, with no ownership record, so the released set is
+  unowned again; it starts only once the regular endpoint no longer holds the set, the instance has read that
+  (`observedGeneration`) and is running, and an interval has passed (it deletes the set and its ownership record), and
+  counts that again after a restart or losing the Lease. A takeover whose records the desired state's set no longer holds fails at once. An operation
+  also waits for the provider's credentials Secret. It is reported `running` with what it waits for, then `succeeded` or
+  `failed`: the reason is the last error external-dns logged (the pod's termination message), else how its container ended or
+  why it never started, else Kubernetes's own. One that can never run (the provider is gone or can't run, no endpoint set or
+  records, nothing the provider can keep) fails at once with the reason. The Job (deadline 5 minutes, no retries, hardened
+  like the instances, labelled so no Deployment selects its pod) stays after it finished, so a restart reads the result
+  instead of running it again; the temporary endpoint goes as soon as the Job is finished, and both when the server
+  stops listing the operation. Nothing runs while the image pin refuses the desired state.
+- **Pruning:** a `DNSEndpoint` the desired state no longer has is deleted (not the temporary ones of operations). A deleted provider's Secret and Deployment go
   two minutes after its endpoints, so its instance can remove the records it owns; the Secret only when its labels say
   it is that provider's, and the Deployment last.
 

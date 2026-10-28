@@ -4,6 +4,7 @@ import { parseDesiredState, parseProviderCredentials, type DesiredStateV1, type 
 import { KubeError, type ApplyOptions } from "../../src/kube/KubeClient.js";
 import { Logger } from "../../src/log.js";
 import { credentialsSecret, dnsEndpoint, externalDnsDeployment, type ManifestSettings } from "../../src/reconcile/manifests.js";
+import { NotWriterError } from "../../src/reconcile/NotWriterError.js";
 import { Reconciler } from "../../src/reconcile/Reconciler.js";
 
 const DEPLOYMENTS = "/apis/apps/v1/namespaces/rapidmx/deployments";
@@ -831,6 +832,100 @@ describe("Reconciler", () => {
         kube.failures.set(`DELETE ${DEPLOYMENTS}/mail-external-dns-old`, new KubeError("boom", 500));
         expect(await reconciler({ providerRemovalDelayMs: 0 }).reconcile(fixture())).toMatchObject({ result: "incomplete" });
         expect(logged("reconcile_failed").map((l) => [l.step, l.kind, l.providerUid])).toEqual([["delete", "Deployment", "old"]]);
+    });
+
+    describe("operations", () => {
+        let runs: { state: DesiredStateV1; writable: boolean }[];
+        let outcome: { pending: boolean; nextAt?: number } | Error;
+
+        function withOperations(extra: Partial<ConstructorParameters<typeof Reconciler>[0]> = {}): Reconciler {
+            return reconciler({
+                operations: {
+                    run: async (state, mayWrite) => {
+                        runs.push({ state, writable: mayWrite() });
+                        if (outcome instanceof Error) {
+                            throw outcome;
+                        }
+                        return outcome;
+                    },
+                },
+                ...extra,
+            });
+        }
+
+        beforeEach(() => {
+            runs = [];
+            outcome = { pending: false };
+        });
+
+        it("runs them after the endpoints are applied and pruned, with the state and the writer's gate", async () => {
+            const state = fixture();
+            kube.put(`${ENDPOINTS}/mail-domain-gone-com`, ours("cloudflare-main"));
+            expect(await withOperations().reconcile(state)).toEqual({ result: "done" });
+            expect(runs).toEqual([{ state, writable: true }]);
+            // Everything the operations may depend on was written before they ran.
+            expect(kube.writes()).toEqual([`APPLY ${DEPLOYMENT}`, `APPLY ${SECRET}`, `APPLY ${ENDPOINT}`, `DELETE ${ENDPOINTS}/mail-domain-gone-com`]);
+        });
+
+        it("ends the pass incomplete while an operation is still on its way, and comes back when the next step is due", async () => {
+            outcome = { pending: true, nextAt: clock + 5000 };
+            expect(await withOperations().reconcile(fixture())).toEqual({ result: "incomplete", nextAt: clock + 5000 });
+            // A deleted provider's removal due sooner wins, and so does the operations' when it is sooner.
+            kube.put(`${DEPLOYMENTS}/mail-external-dns-old`, ours("old"));
+            expect(await withOperations({ providerRemovalDelayMs: 1000 }).reconcile(fixture())).toEqual({ result: "incomplete", nextAt: clock + 1000 });
+            expect(await withOperations({ providerRemovalDelayMs: 60000 }).reconcile(fixture())).toEqual({ result: "incomplete", nextAt: clock + 5000 });
+            outcome = { pending: true };
+            expect(await withOperations().reconcile(fixture())).toMatchObject({ result: "incomplete" });
+        });
+
+        it("hands the operations a gate that closes when the reconciler stops, so a stopping reconciler writes nothing more", async () => {
+            const seen: boolean[] = [];
+            const r: Reconciler = reconciler({
+                operations: {
+                    run: async (_state, mayWrite) => {
+                        seen.push(mayWrite());
+                        void r.stop();
+                        seen.push(mayWrite());
+                        return { pending: false };
+                    },
+                },
+            });
+            await r.reconcile(fixture());
+            expect(seen).toEqual([true, false]);
+        });
+
+        it("logs an operation pass that fails and still ends the others, the pass incomplete", async () => {
+            outcome = new KubeError("unavailable", 503);
+            expect(await withOperations().reconcile(fixture())).toEqual({ result: "incomplete" });
+            expect(logged("reconcile_failed").map((l) => [l.step, l.kind])).toEqual([["run", "Operation"]]);
+        });
+
+        it("ends the pass as not the writer when the operations lose the right to write", async () => {
+            outcome = new NotWriterError();
+            expect(await withOperations().reconcile(fixture())).toEqual({ result: "not_writer" });
+        });
+
+        it("runs no operation while the image pin refuses the desired state, and when it refuses the state whole or may not write", async () => {
+            const state = fixture();
+            state.externalDnsImage = "other";
+            expect(await withOperations().reconcile(state)).toEqual({ result: "incomplete" });
+            state.providers.push({ ...state.providers[0] });
+            expect(await withOperations().reconcile(state)).toEqual({ result: "refused" });
+            writable = false;
+            expect(await withOperations().reconcile(fixture())).toEqual({ result: "not_writer" });
+            expect(runs).toEqual([]);
+        });
+
+        it("leaves the temporary endpoints of operations to the runner: they are not regular endpoints to prune", async () => {
+            kube.put(`${ENDPOINTS}/mail-op-71a0ef7195df4865`, {
+                "app.kubernetes.io/managed-by": "rapidmx-dns-controller",
+                "app.kubernetes.io/instance": "mail",
+                "rapidmx.io/dns-operation": "71a0ef7195df4865",
+            });
+            expect(await withOperations().reconcile(fixture())).toEqual({ result: "done" });
+            expect(kube.writes().some((w) => w.startsWith("DELETE"))).toBe(false);
+            expect(kube.objects.has(`${ENDPOINTS}/mail-op-71a0ef7195df4865`)).toBe(true);
+        });
     });
 
     it("reconciles on every update, coalescing the updates that arrive during a pass, resyncs, and retries with backoff", async () => {

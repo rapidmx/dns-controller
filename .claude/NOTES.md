@@ -314,3 +314,55 @@ first release.
   so an operation still listed after re-acquiring is run (or its result recorded) again.
 - Tests first, each failing without its fix; `yarn build` and `yarn test` pass (374 tests, 100% coverage). The spec text
   (7.2, 7.3, 7.4, 7.7, 18.2) went out in a separate restapi commit.
+
+### D4 - operations (C4)
+
+Spec 9.3, "As implemented in dns-controller C4", is the reference. New `src/reconcile/OperationRunner.ts`, run by the
+Reconciler at the end of every pass that published the state (after apply and prune, not while the image pin refuses it,
+via `ReconcilerOptions.operations`; `NotWriterError` moved to its own file for the two to share). `manifests.ts` gained
+`operationJob()`, `operationEndpoint()`, `operationName()`, `endpointEntries()` (what `dnsEndpoint()` now uses too) and
+`isOurSecret()` / `ENDPOINT_SET_ID` (moved out of the Reconciler); `StatusCollector` exports `readyReplicas()`.
+
+- **Names and labels:** Job and temporary endpoint are `<fullname>-op-<16 hex of sha256(operation id)>` (an id can be any
+  text; the id itself is in the annotation `rapidmx.io/dns-operation-id`). Both carry `managed-by`, `instance` and
+  `rapidmx.io/dns-operation`, **never** `rapidmx.io/dns-provider`: the instances' `--label-filter` and Deployment selectors
+  must not see them. `Reconciler.prune()` skips endpoints with the operation label (the runner owns them).
+- **Jobs are POSTed** (`kube.create`), not applied: the Role has `create/get/list/delete` on Jobs and no `patch`. Deleted with
+  `?propagationPolicy=Background` (the API's default for Jobs orphans the pods). Pod failure reasons come from one list of
+  pods by `job-name` (`pods get/list` is in the Role): the termination message is the log tail
+  (`FallbackToLogsOnError`), read for its last JSON `error`/`fatal` `msg`.
+- **Waits are the point of the design:** a takeover starts only once the regular `DNSEndpoint` holds each name and type
+  (else the regular `--policy=sync` instance deletes what it finds owned and unwanted); a restore only once the regular
+  endpoint no longer holds the set (or is gone), the instance has a ready replica, and 2 min have passed since first seeing
+  both (in memory, like a deleted provider's removal; reset when either changes). The controller cannot read the provider's
+  records, so there is no check that the ownership record is really gone. A disabled provider's restore waits until it is
+  enabled. All operations wait for the provider's Secret (labels + generation). Waiting is reported `running` with a message
+  (the server keeps an old message when a report has none, so every `running` report carries one).
+- **The Job is the durable record:** kept until the server stops listing the operation (no `ttlSecondsAfterFinished`: a TTL could
+  drop a result the server had not taken yet and run the operation again), so a restart or a re-acquired Lease (ledger cleared) reads the result from the Job instead of re-running.
+  The temporary endpoint is deleted as soon as its Job is finished, or when no Job uses it. Results are recorded only while
+  `mayWrite()` and only for an operation the newest state (`sync.desiredState`) still lists (the D3 precondition).
+- **Fails at once** (final, never reopened): provider missing or missing a required credential, a takeover/restore without
+  a valid `endpointSetId` (it becomes part of a request path: `ENDPOINT_SET_ID`) or records, a takeover whose set belongs to
+  another provider, nothing the provider can keep. A Job that failed (`backoffLimit: 0`, deadline 300 s) fails the operation.
+- No new setting. Open for D5/server: nothing in the status report says the restored set is live (the server's lookup does).
+- Tests first: the new manifests, runner, Reconciler and index tests failed on the missing modules, then passed;
+  `yarn build`, `yarn lint` and `yarn test` pass (439 tests, 100% coverage) from D:. The spec text (7.2, 9.3, 18.2) is
+  uncommitted in restapi until stage 3.
+- Review resolved (6 findings):
+  - the temporary endpoint is in use from the first write of a launch, so a Job creation whose answer is lost (timeout,
+    504) no longer has its endpoint deleted at the end of the run; it goes once the Job is finished or unlisted. Not done,
+    deliberately: checking the endpoint's `observedGeneration` before reporting success, since with the endpoint kept
+    until the Job finished, a finished Job did run with it present, and the check would fail operations on a status
+    update external-dns merely logs.
+  - a takeover whose names and types the state's own endpoint set lacks fails at once ("no longer holds the records"); it
+    waits only while the state has them and the live endpoint doesn't yet.
+  - a restore's clock starts only once the regular endpoint's `status.observedGeneration` reached its
+    `metadata.generation` (when the endpoint exists) as well as the set being absent and a ready replica. Still no proof
+    of a successful sync until D5's `lastSyncAt`; the server's live check (9.5, step 3) is not optional.
+  - failure reasons: an error/fatal log entry, else the container's terminated reason and exit code (`OOMKilled (exit code
+    137)`), else the waiting reason, else the Job condition's reason and message; a log line that is not an error is never
+    the reason.
+  - an operation the newest state no longer lists is not launched (`latest()` is asked before `launch()`).
+  - `OperationRunner.forget()` clears the restore clocks when the Lease is lost (`onLost`, with the ledger).
+  - `ttlSecondsAfterFinished` dropped from the Job (see above). 446 tests, 100% coverage. Spec 9.3/9.5 updated in restapi.

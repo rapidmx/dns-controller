@@ -1,5 +1,5 @@
 import { readFileSync } from "node:fs";
-import { parseDesiredState, type DesiredStateV1, type DnsProviderV1, type EndpointSetV1 } from "../../src/api/v1.js";
+import { parseDesiredState, type DesiredStateV1, type DnsProviderV1, type EndpointSetV1, type OperationV1 } from "../../src/api/v1.js";
 import {
     acceptsExternalDnsImage,
     credentialsProblem,
@@ -8,8 +8,12 @@ import {
     dnsEndpointName,
     externalDnsArgs,
     externalDnsDeployment,
+    isOurSecret,
     managedRecordKinds,
     nestedZones,
+    operationEndpoint,
+    operationJob,
+    operationName,
     ownershipEndpoint,
     quoteTxtTarget,
     txtTargets,
@@ -580,5 +584,268 @@ describe("dnsEndpoint", () => {
         const text = JSON.stringify(fixture.endpointSets.map((s) => dnsEndpoint(s, "cloudflare", settings)));
         expect(text).not.toContain("rmx-");
         expect(text).not.toContain("heritage=");
+    });
+});
+
+describe("operationName", () => {
+    it("is the release's name with a hash of the operation id, so any id makes a valid, bounded name", () => {
+        expect(operationName(settings, "op-1")).toBe("mail-op-71a0ef7195df4865");
+        expect(operationName(settings, "3f6c0a1e-9b1d-4f43-8a52-0c2d6f7e1a11")).toBe("mail-op-30d743a1ef714297");
+        // An id no label could hold is still a name.
+        expect(operationName(settings, "Ö/ id with spaces")).toMatch(/^mail-op-[0-9a-f]{16}$/);
+        // A Job name is at most 63 characters: a long release name is cut, never ending in a hyphen.
+        const long = operationName({ fullname: `${"a".repeat(39)}-${"b".repeat(23)}` }, "op-1");
+        expect(long).toBe(`${"a".repeat(39)}-op-71a0ef7195df4865`);
+        expect(long.length).toBeLessThanOrEqual(63);
+    });
+});
+
+describe("isOurSecret", () => {
+    it("holds a Secret to three labels: this controller, the dns kind and the provider", () => {
+        const labels = {
+            "app.kubernetes.io/managed-by": "rapidmx-dns-controller",
+            "rapidmx.io/secret-kind": "dns",
+            "rapidmx.io/dns-provider": "p1",
+        };
+        expect(isOurSecret(labels, "p1")).toBe(true);
+        expect(isOurSecret(labels, "p2")).toBe(false);
+        expect(isOurSecret({ ...labels, "rapidmx.io/secret-kind": "other" }, "p1")).toBe(false);
+        expect(isOurSecret({ ...labels, "app.kubernetes.io/managed-by": "helm" }, "p1")).toBe(false);
+        expect(isOurSecret(undefined, "p1")).toBe(false);
+    });
+});
+
+const HASH = "71a0ef7195df4865";
+
+function operation(patch: Partial<OperationV1>): OperationV1 {
+    return { id: "op-1", type: "takeover", providerUid: "cloudflare-main", endpointSetId: "domain-example-com", ...patch };
+}
+
+/** The records a takeover or a restore writes, as the server sends them: TXT values unquoted. */
+const RECORDS: OperationV1["records"] = [
+    { dnsName: "example.com", recordType: "MX", targets: ["10 mail.example.com"], ttl: 300 },
+    { dnsName: "example.com", recordType: "TXT", targets: ["v=spf1 mx ~all", "keep me"], ttl: 300 },
+];
+
+type JobSpec = {
+    metadata: { name: string; namespace: string; labels: Record<string, string>; annotations: Record<string, string> };
+    spec: {
+        backoffLimit: number;
+        activeDeadlineSeconds: number;
+        template: {
+            metadata: { labels: Record<string, string> };
+            spec: { restartPolicy: string; serviceAccountName: string; containers: (Container & Record<string, unknown>)[] } & Record<string, unknown>;
+        };
+    };
+};
+const job = (op: OperationV1, p: DnsProviderV1 = cloudflare, excluded: string[] = []): JobSpec => operationJob(op, p, settings, excluded) as unknown as JobSpec;
+const jobContainer = (j: JobSpec): Container & Record<string, unknown> => j.spec.template.spec.containers[0];
+
+/** The arguments every operation Job has, in order, before the provider-specific ones (spec 9.3). */
+function jobArgs(type: string, zones: string[], kinds: string[], rest: string[]): string[] {
+    return [
+        "--source=crd",
+        "--crd-source-apiversion=externaldns.k8s.io/v1alpha1",
+        "--crd-source-kind=DNSEndpoint",
+        "--namespace=rapidmx",
+        `--label-filter=rapidmx.io/dns-operation=${HASH}`,
+        `--provider=${type}`,
+        ...zones.map((zone) => `--domain-filter=${zone}`),
+        "--registry=noop",
+        "--policy=upsert-only",
+        ...kinds.map((kind) => `--managed-record-types=${kind}`),
+        ...rest,
+    ];
+}
+
+describe("operationJob", () => {
+    it("is the golden one-shot Job of a takeover: the pinned image, the noop registry, upsert only, once, selecting only its own endpoint", () => {
+        expect(operationJob(operation({}), cloudflare, settings, [])).toEqual({
+            apiVersion: "batch/v1",
+            kind: "Job",
+            metadata: {
+                name: `mail-op-${HASH}`,
+                namespace: "rapidmx",
+                labels: {
+                    "app.kubernetes.io/managed-by": "rapidmx-dns-controller",
+                    "app.kubernetes.io/instance": "mail",
+                    "rapidmx.io/dns-operation": HASH,
+                },
+                annotations: { "rapidmx.io/dns-operation-id": "op-1" },
+            },
+            spec: {
+                backoffLimit: 0,
+                activeDeadlineSeconds: 300,
+                template: {
+                    metadata: {
+                        labels: {
+                            "app.kubernetes.io/name": "external-dns-operation",
+                            "app.kubernetes.io/instance": "mail",
+                            "app.kubernetes.io/managed-by": "rapidmx-dns-controller",
+                            "rapidmx.io/dns-operation": HASH,
+                        },
+                    },
+                    spec: {
+                        restartPolicy: "Never",
+                        serviceAccountName: "mail-external-dns",
+                        securityContext: {
+                            runAsNonRoot: true,
+                            runAsUser: 65532,
+                            runAsGroup: 65532,
+                            fsGroup: 65532,
+                            seccompProfile: { type: "RuntimeDefault" },
+                        },
+                        containers: [
+                            {
+                                name: "external-dns",
+                                image: PIN,
+                                args: [...jobArgs("cloudflare", ["example.com"], ALL_KINDS, ["--once", "--log-format=json"]), "--zone-id-filter=0123456789abcdef0123456789abcdef"],
+                                env: [{ name: "CF_API_TOKEN", valueFrom: { secretKeyRef: { name: "mail-dns-cloudflare-main", key: "apiToken" } } }],
+                                // The last log lines become the pod's termination message when it fails: the reason reported back.
+                                terminationMessagePolicy: "FallbackToLogsOnError",
+                                securityContext: {
+                                    allowPrivilegeEscalation: false,
+                                    readOnlyRootFilesystem: true,
+                                    runAsNonRoot: true,
+                                    capabilities: { drop: ["ALL"] },
+                                },
+                            },
+                        ],
+                    },
+                },
+            },
+        });
+    });
+
+    it("tests the credentials with a dry run: the same Job with --dry-run, which a takeover or a restore never has", () => {
+        expect(jobContainer(job(operation({ type: "test", endpointSetId: undefined }))).args).toEqual([
+            ...jobArgs("cloudflare", ["example.com"], ALL_KINDS, ["--once", "--dry-run", "--log-format=json"]),
+            "--zone-id-filter=0123456789abcdef0123456789abcdef",
+        ]);
+        for (const type of ["takeover", "restore"] as const) {
+            expect(jobContainer(job(operation({ type }))).args).not.toContain("--dry-run");
+            expect(jobContainer(job(operation({ type }))).args).toContain("--once");
+        }
+    });
+
+    it("never touches the regular instance's endpoints or registry: no provider label, no owner id, no sync policy", () => {
+        const j = job(operation({}));
+        const text = JSON.stringify(j);
+        // The regular instance selects rapidmx.io/dns-provider=<uid>; neither the Job nor its pods carry it, so no Deployment's selector matches them.
+        expect(text).not.toContain("rapidmx.io/dns-provider");
+        expect(text).not.toContain("--txt-owner-id");
+        expect(text).not.toContain("--policy=sync");
+        expect(text).not.toContain("--registry=txt");
+        expect(text).not.toContain("--events");
+        expect(jobContainer(j)).not.toHaveProperty("ports");
+        expect(jobContainer(j)).not.toHaveProperty("livenessProbe");
+    });
+
+    it("takes the provider's arguments and credentials like its instance, by reference only", () => {
+        const route53 = provider({ uid: "r53", type: "route53", options: { region: "us-east-1", zoneType: "public" }, credentials: { keys: ["accessKeyId", "secretAccessKey"], generation: 2 } });
+        const j = job(operation({ providerUid: "r53" }), route53);
+        expect(jobContainer(j).args).toEqual(
+            expect.arrayContaining(["--provider=aws", "--domain-filter=example.com", "--aws-zone-type=public", "--registry=noop", "--policy=upsert-only"])
+        );
+        expect(jobContainer(j).env).toEqual([
+            { name: "AWS_REGION", value: "us-east-1" },
+            { name: "AWS_ACCESS_KEY_ID", valueFrom: { secretKeyRef: { name: "mail-dns-r53", key: "accessKeyId" } } },
+            { name: "AWS_SECRET_ACCESS_KEY", valueFrom: { secretKeyRef: { name: "mail-dns-r53", key: "secretAccessKey" } } },
+        ]);
+        // rfc2136 manages no MX or SRV, in a Job as in its instance.
+        expect(jobContainer(job(operation({}), provider({ type: "rfc2136", options: { hosts: ["ns1.example.com"] } }))).args).toEqual(
+            expect.arrayContaining(["--managed-record-types=TXT", "--rfc2136-axfr"])
+        );
+        expect(jobContainer(job(operation({}), provider({ type: "rfc2136" }))).args).not.toContain("--managed-record-types=MX");
+    });
+
+    it("mounts Google's key from the Secret, read-only, like its instance, and has no volumes without a credential file", () => {
+        const google = job(operation({}), provider({ type: "google", options: { project: "p" }, credentials: { keys: ["serviceAccountJson"], generation: 1 } }));
+        expect(google.spec.template.spec.volumes).toEqual([{ name: "credentials", secret: { secretName: "mail-dns-p1", items: [{ key: "serviceAccountJson", path: "credentials.json" }] } }]);
+        expect(jobContainer(google).volumeMounts).toEqual([{ name: "credentials", mountPath: "/etc/external-dns/google", readOnly: true }]);
+        expect(job(operation({})).spec.template.spec).not.toHaveProperty("volumes");
+    });
+
+    it("keeps its provider out of the nested zones of other configs and sets the configured resources", () => {
+        const args = jobContainer(job(operation({}), cloudflare, ["sub.example.com"])).args;
+        expect(args).toContain("--exclude-domains=sub.example.com");
+        expect(args.indexOf("--exclude-domains=sub.example.com")).toBe(args.indexOf("--domain-filter=example.com") + 1);
+        const resources = { limits: { memory: "64Mi" } };
+        expect(jobContainer(operationJob(operation({}), cloudflare, { ...settings, externalDnsResources: resources }, []) as unknown as JobSpec).resources).toEqual(resources);
+        expect(jobContainer(job(operation({})))).not.toHaveProperty("resources");
+    });
+
+    it("carries no credential value, only the names of the Secret and its keys", () => {
+        expect(JSON.stringify(job(operation({})))).not.toContain("cf-example-token");
+    });
+});
+
+describe("operationEndpoint", () => {
+    type Entry = { dnsName: string; recordType: string; targets: string[]; recordTTL?: number };
+    const entries = (m: ReturnType<typeof operationEndpoint>): Entry[] => (m as unknown as { spec: { endpoints: Entry[] } }).spec.endpoints;
+    const owned = (regular: string): string => `"heritage=external-dns,external-dns/owner=${OWNER},external-dns/resource=crd/rapidmx/${regular}"`;
+
+    it("is a takeover's temporary endpoint: the wanted records in the provider's form, then the ownership record of each name and type, without a TTL", () => {
+        const endpoint = operationEndpoint(operation({ records: RECORDS }), "cloudflare", OWNER, settings);
+        expect(endpoint).toMatchObject({
+            apiVersion: "externaldns.k8s.io/v1alpha1",
+            kind: "DNSEndpoint",
+            metadata: {
+                name: `mail-op-${HASH}`,
+                namespace: "rapidmx",
+                // Selected by the Job's label filter alone: never by an instance's, and never pruned as a regular endpoint.
+                labels: { "app.kubernetes.io/managed-by": "rapidmx-dns-controller", "app.kubernetes.io/instance": "mail", "rapidmx.io/dns-operation": HASH },
+            },
+        });
+        expect(JSON.stringify(endpoint)).not.toContain("rapidmx.io/dns-provider");
+        expect(entries(endpoint)).toEqual([
+            { dnsName: "example.com", recordType: "MX", targets: ["10 mail.example.com"], recordTTL: 300 },
+            { dnsName: "example.com", recordType: "TXT", targets: ['"v=spf1 mx ~all"', '"keep me"'], recordTTL: 300 },
+            { dnsName: "rmx-mx.example.com", recordType: "TXT", targets: [owned("mail-domain-example-com")] },
+            { dnsName: "rmx-txt.example.com", recordType: "TXT", targets: [owned("mail-domain-example-com")] },
+        ]);
+    });
+
+    it("names the regular endpoint of the set as the ownership records' resource, so the regular instance sees no change", () => {
+        const endpoint = operationEndpoint(operation({ records: RECORDS, endpointSetId: "hosts-cloudflare-main" }), "cloudflare", OWNER, settings);
+        expect(entries(endpoint)[2].targets[0]).toContain("external-dns/resource=crd/rapidmx/mail-hosts-cloudflare-main");
+    });
+
+    it("writes one ownership record per name and type, however many records share them", () => {
+        const twice: OperationV1["records"] = [
+            { dnsName: "example.com", recordType: "TXT", targets: ["a"] },
+            { dnsName: "example.com", recordType: "TXT", targets: ["b"] },
+            { dnsName: "_dmarc.example.com", recordType: "TXT", targets: ["v=DMARC1; p=none"] },
+        ];
+        const names = entries(operationEndpoint(operation({ records: twice }), "cloudflare", OWNER, settings)).map((e) => e.dnsName);
+        expect(names).toEqual(["example.com", "example.com", "_dmarc.example.com", "rmx-txt.example.com", "rmx-txt._dmarc.example.com"]);
+    });
+
+    it("is a restore's: only the SPF and the kept values, quoted, and no ownership record, so the restored set is unowned again", () => {
+        const restore = operation({ type: "restore", records: [{ dnsName: "example.com", recordType: "TXT", targets: ["v=spf1 mx ~all", "keep me"], ttl: 300 }] });
+        const endpoint = operationEndpoint(restore, "cloudflare", OWNER, settings);
+        expect(entries(endpoint)).toEqual([{ dnsName: "example.com", recordType: "TXT", targets: ['"v=spf1 mx ~all"', '"keep me"'], recordTTL: 300 }]);
+        expect(JSON.stringify(endpoint)).not.toContain("rmx-");
+        expect(JSON.stringify(endpoint)).not.toContain("heritage=");
+    });
+
+    it("leaves out what the provider can't keep, and its ownership record with it", () => {
+        // No MX on rfc2136, and an SPF value with spaces can't be kept there.
+        expect(entries(operationEndpoint(operation({ records: RECORDS }), "rfc2136", OWNER, settings))).toEqual([]);
+        const plain = operation({ records: [{ dnsName: "example.com", recordType: "TXT", targets: ["rapidmx-domain-verification=3f9c1d"] }] });
+        expect(entries(operationEndpoint(plain, "rfc2136", OWNER, settings)).map((e) => e.dnsName)).toEqual(["example.com", "rmx-txt.example.com"]);
+    });
+
+    it("marks Cloudflare's hosts unproxied, like the regular endpoint", () => {
+        const host = operation({ records: [{ dnsName: "mail.example.com", recordType: "A", targets: ["203.0.113.5"] }] });
+        expect(entries(operationEndpoint(host, "cloudflare", OWNER, settings))[0]).toMatchObject({ providerSpecific: [{ name: "cloudflare/proxied", value: "false" }] });
+    });
+
+    it("refuses a takeover that names no endpoint set, whose ownership records it could not write", () => {
+        expect(() => operationEndpoint(operation({ records: RECORDS, endpointSetId: undefined }), "cloudflare", OWNER, settings)).toThrow("endpoint set");
+    });
+
+    it("has no records for an operation that carries none", () => {
+        expect(entries(operationEndpoint(operation({ type: "test" }), "cloudflare", OWNER, settings))).toEqual([]);
     });
 });

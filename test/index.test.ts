@@ -13,6 +13,8 @@ describe("startController / runMain", () => {
     let fetchCalls: [string, RequestInit][];
     /** The items a list of the namespace's objects answers with, by path; every other read is a 404. */
     let listed: Record<string, unknown[]>;
+    /** The objects a read of one path answers with; every other read is a 404. */
+    let found: Record<string, unknown>;
     /** The applied DNSEndpoint and the status reports, in the order they happened. */
     let order: string[];
 
@@ -23,6 +25,9 @@ describe("startController / runMain", () => {
         }
         if (request.method === "GET" && listed[request.url.pathname]) {
             return { status: 200, body: JSON.stringify({ items: listed[request.url.pathname] }) };
+        }
+        if (request.method === "GET" && found[request.url.pathname]) {
+            return { status: 200, body: JSON.stringify(found[request.url.pathname]) };
         }
         if (request.method === "GET") {
             return { status: 404, body: JSON.stringify({ kind: "Status", reason: "NotFound" }) };
@@ -77,6 +82,7 @@ describe("startController / runMain", () => {
         };
         fetchCalls = [];
         listed = {};
+        found = {};
         order = [];
         kubeRequests = [];
         lines = [];
@@ -215,7 +221,7 @@ describe("startController / runMain", () => {
                 running.ledger.record("op-1", "running");
                 running.ledger.record("op-old", "succeeded");
                 await waitFor(() => running.sync.desiredState !== undefined);
-                expect(running.ledger.get("op-1")).toEqual({ state: "running" });
+                expect(running.ledger.get("op-1")).toMatchObject({ state: "running" });
                 expect(running.ledger.get("op-old")).toBeUndefined();
                 await waitFor(() => running.elector.holds());
             } finally {
@@ -223,6 +229,39 @@ describe("startController / runMain", () => {
             }
             // Stopping released the Lease.
             expect(running.ledger.get("op-1")).toBeUndefined();
+        } finally {
+            desiredState.operations = served;
+        }
+    });
+
+    it("runs a queued operation as a one-shot Job once the instance and the Secret are there, and reports it running", async () => {
+        const served = desiredState.operations;
+        desiredState.operations = [{ id: "op-1", type: "test", providerUid: "cloudflare-main" }];
+        listed["/apis/batch/v1/namespaces/rapidmx/jobs"] = [];
+        listed["/apis/externaldns.k8s.io/v1alpha1/namespaces/rapidmx/dnsendpoints"] = [];
+        found["/api/v1/namespaces/rapidmx/secrets/mail-dns-cloudflare-main"] = {
+            metadata: {
+                labels: { "app.kubernetes.io/managed-by": "rapidmx-dns-controller", "rapidmx.io/secret-kind": "dns", "rapidmx.io/dns-provider": "cloudflare-main" },
+                annotations: { "rapidmx.io/credentials-generation": "1" },
+                ownerReferences: [{ kind: "Deployment", name: "mail-external-dns-cloudflare-main", uid: "uid-of-mail-external-dns-cloudflare-main" }],
+            },
+        };
+        try {
+            const running = await startController(env, { kubeTransport, fetch: fakeFetch, sink: (l) => lines.push(l), healthPort: 0 });
+            try {
+                await waitFor(() => kubeRequests.some((r) => r.method === "POST" && r.url.pathname === "/apis/batch/v1/namespaces/rapidmx/jobs"));
+                const job = JSON.parse(String(kubeRequests.find((r) => r.method === "POST" && r.url.pathname.endsWith("/jobs")).body));
+                expect(job).toMatchObject({ kind: "Job", metadata: { name: "mail-op-71a0ef7195df4865" } });
+                expect(job.spec.template.spec.containers[0].args).toEqual(expect.arrayContaining(["--registry=noop", "--policy=upsert-only", "--once", "--dry-run"]));
+                // The result reaches the server with the report that follows the pass.
+                await waitFor(() =>
+                    fetchCalls.some(([url, init]) => url.endsWith("/v1/status") && JSON.parse(String(init.body)).operations.some((o: { id: string }) => o.id === "op-1"))
+                );
+                const reports = fetchCalls.filter(([url]) => url.endsWith("/v1/status")).map(([, init]) => JSON.parse(String(init.body)));
+                expect(reports.at(-1).operations).toEqual([{ id: "op-1", state: "running", message: expect.stringContaining("dry run") }]);
+            } finally {
+                await running.stop();
+            }
         } finally {
             desiredState.operations = served;
         }

@@ -15,16 +15,19 @@ import {
     deploymentName,
     dnsEndpoint,
     dnsEndpointName,
+    ENDPOINT_SET_ID,
     externalDnsDeployment,
     FIELD_MANAGER,
-    LABEL_MANAGED_BY,
+    isOurSecret,
+    LABEL_OPERATION,
     LABEL_PROVIDER,
-    LABEL_SECRET_KIND,
     nestedZones,
     type Manifest,
     type ManifestSettings,
     type SecretManifest,
 } from "./manifests.js";
+import { NotWriterError } from "./NotWriterError.js";
+import type { OperationRunner } from "./OperationRunner.js";
 
 export interface ReconcilerOptions {
     kube: Pick<KubeClient, "apply" | "get" | "getMetadata" | "delete">;
@@ -41,6 +44,11 @@ export interface ReconcilerOptions {
     /** How long a deleted provider's instance outlives its endpoints, so it can delete the records it owns (one interval and a margin). */
     providerRemovalDelayMs?: number;
     now?: () => number;
+    /**
+     * Runs the operations of the desired state (phase C4) at the end of every pass that published it, once the endpoints are
+     * applied and pruned; not while the image pin refuses the state. Throws `NotWriterError` like a write.
+     */
+    operations?: Pick<OperationRunner, "run">;
     /** Called after each pass that ran (not one refused for lack of the Lease), so the status report follows what the pass applied. Must not throw. */
     onPass?: () => void;
 }
@@ -64,13 +72,8 @@ type Step = Record<string, string>;
  */
 type Attempt = (step: Step, call: () => Promise<unknown>) => Promise<boolean>;
 
-/** It may no longer write: the pass stops at once. */
-class NotWriterError extends Error {}
-
 /** A provider uid as the server makes them, and as a label value and name suffix must be (at most 40 characters). */
 const PROVIDER_UID: RegExp = /^[a-z0-9]([a-z0-9-]{0,38}[a-z0-9])?$/;
-/** An endpoint set id: a DNS label-like suffix of at most 180 characters, so `<fullname>-<id>` stays a valid name. */
-const ENDPOINT_SET_ID: RegExp = /^[a-z0-9]([a-z0-9-]{0,178}[a-z0-9])?$/;
 /** A zone as the server normalizes them: a lowercase domain name of at least two labels (never a top-level domain alone). */
 const ZONE: RegExp = /^(?=.{1,253}$)[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?(\.[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?)+$/;
 
@@ -97,11 +100,6 @@ interface SecretState {
 /** What the pod template says about a Secret there whose generation is unknown: no generation the server gives, so the pod rolls once the Secret is rewritten. */
 const UNKNOWN_GENERATION = -1;
 
-/** Whether a Secret's labels say this controller wrote it for provider `uid` (the same test before any change or delete). */
-function isOurSecret(labels: Record<string, string> | undefined, uid: string): boolean {
-    return labels?.[LABEL_MANAGED_BY] === FIELD_MANAGER && labels[LABEL_SECRET_KIND] === "dns" && labels[LABEL_PROVIDER] === uid;
-}
-
 /**
  * Turns the desired state into the namespace's objects (spec 7.4, 7.5) and keeps them so:
  *
@@ -112,6 +110,8 @@ function isOurSecret(labels: Record<string, string> | undefined, uid: string): b
  * - **Per endpoint set:** its DNSEndpoint.
  * - **Pruning:** a DNSEndpoint it manages that the state no longer has is deleted. A deleted provider's Secret and
  * Deployment go one interval after its endpoints, so its instance can delete what it owns.
+ * - **Operations:** once all that is applied, the `OperationRunner` runs the state's operations, whose temporary
+ * DNSEndpoints (labelled for their Job, not for an instance) pruning leaves alone.
  *
  * Every write is a server-side apply as `rapidmx-dns-controller` (idempotent) or a delete, each checked against the gate
  * immediately before it. Passes never overlap; a state that arrives during one is applied right after it.
@@ -498,8 +498,19 @@ export class Reconciler {
                 const manifest: Manifest = dnsEndpoint(set, types.get(set.providerUid) as DnsProviderV1["type"], settings);
                 await attempt({ step: "apply", kind: "DNSEndpoint", name: manifest.metadata.name }, () => this.apply(endpoints, manifest));
             }
-            const nextAt: number | undefined = await this.prune(state, attempt);
-            return { result: failed ? "incomplete" : "done", ...(nextAt !== undefined ? { nextAt } : {}) };
+            let nextAt: number | undefined = await this.prune(state, attempt);
+            let pending = false;
+            const { operations } = this.options;
+            if (operations && imageAccepted) {
+                await attempt({ step: "run", kind: "Operation" }, async () => {
+                    const outcome = await operations.run(state, () => !this.stopped && this.options.gate.mayWrite());
+                    pending = outcome.pending;
+                    if (outcome.nextAt !== undefined) {
+                        nextAt = Math.min(nextAt ?? outcome.nextAt, outcome.nextAt);
+                    }
+                });
+            }
+            return { result: failed || pending ? "incomplete" : "done", ...(nextAt !== undefined ? { nextAt } : {}) };
         } catch (err) {
             if (err instanceof NotWriterError) {
                 log.debug("reconcile_interrupted", { reason: "this controller may no longer write" });
@@ -533,7 +544,8 @@ export class Reconciler {
         const wantedEndpoints: Set<string> = new Set(state.endpointSets.map((set: EndpointSetV1) => dnsEndpointName(settings, set.id)));
         // The providers some of whose unwanted endpoints are still there.
         const endpointsLeft: Set<string> = new Set();
-        for (const item of listedEndpoints.filter((i) => !wantedEndpoints.has(i.metadata.name))) {
+        // The temporary endpoints of operations are the OperationRunner's.
+        for (const item of listedEndpoints.filter((i) => !wantedEndpoints.has(i.metadata.name) && i.metadata.labels[LABEL_OPERATION] === undefined)) {
             if (!(await attempt({ step: "delete", kind: "DNSEndpoint", name: item.metadata.name }, () => this.remove(`${endpoints}/${item.metadata.name}`)))) {
                 endpointsLeft.add(item.metadata.labels[LABEL_PROVIDER]);
             }
