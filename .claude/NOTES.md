@@ -401,9 +401,47 @@ passes `overrides.fetch`).
 - **Churn gate for restapi:** `applyProviderStatus` skips the row write only when the status other than `reportedAt` is
   unchanged, and `lastSyncAt` (already stored) now moves with every sync (external-dns `--interval=1m`), so each report would
   version-bump the DnsProvider row and 409 an admin's edit. Before D5 ships against restapi, its comparison must leave out the
-  volatile fields (`lastSyncAt`, `registryErrors`, `sourceErrors`, and `reportedAt`) so they refresh on the 5-minute cadence.
+  volatile fields (`lastSyncAt`, `registryErrors`, `sourceErrors`, `providerErrors` and `reportedAt`) so they refresh on the 5-minute cadence.
 - **Open restapi follow-up (with D3's `lastRolloutAt`):** `ProviderStatusV1`, `parseStatusReport` and `applyProviderStatus` carry
   none of `registryErrors`, `sourceErrors`, `providerErrors`, `ownerMismatchRecords`; the shared `status-report.json` fixture is
   unchanged (it has `lastSyncAt`) until restapi has them, then both change together.
 - Tests first (the new parser/collector/index tests failed on the missing module and options, then passed); `yarn lint`,
   `yarn build` and `yarn test` pass (487 tests, 100% coverage) from D:. Spec text uncommitted in restapi until stage 3.
+
+### Releases - readiness of the first image (no release made)
+
+Spec 18.2, "Releases", is the reference. The spec planned the first release after D1 to D3 and D4/D5 later, but D1 to D5 are all
+on `main`, so the first release carries all five (the spec now says so). Nothing runs the controller until server step S9 pins it.
+
+- `test/release.test.ts` pins what the release is: private project, no run-time dependencies (no `node_modules` in the image), no
+  chart, a Dockerfile whose last stage is the distroless `nonroot` runtime with only `package.json` and `dist` copied and only
+  8081 exposed, `CMD ["dist/src/main.js"]` with no ENTRYPOINT (node is PID 1), the publish gate (tag on `main`, every Build green,
+  tag equal to the package.json version, a prerelease never `latest`), and the contract fixtures byte-identical with restapi's
+  (`it.runIf` the sibling `../restapi` is checked out; CI has this repo alone, so locally only). The tests pass on the existing
+  files, since the image was already built this way; each was shown to fail on the change it guards (an added `EXPOSE 8080`, one
+  byte added to a fixture).
+- Checked by hand: `docker build --pull .` succeeds, and the image run with `--read-only --cap-drop ALL`, the ServiceAccount
+  files mounted and no server, starts as `nonroot` (`started` with version `0.0.0`), `/healthz` and `/readyz` answer 200,
+  `dns_api_unavailable` is retried with backoff (no projected token), SIGTERM ends it with exit 0. A missing setting ends it with
+  exit 1 and `start_failed`.
+- Release notes: the first bullet no longer says "not yet released" or "does not manage external-dns yet".
+- **For the release and S9:** `package.json` stays `0.0.0` until JP asks for the release. The settings S9 must set are
+  `DNS_CONTROLLER_SERVER_URL`, `DNS_CONTROLLER_FULLNAME`, `DNS_CONTROLLER_RELEASE`, `DNS_CONTROLLER_LEASE_NAME` (required); the
+  projected token is read from `/var/run/secrets/rapidmx/internal-dns/token` (audience `rapidmx-internal-dns`).
+- **Open in restapi before the server release that pins this image** (D3, D5): `ProviderStatusV1`, `parseStatusReport` and
+  `applyProviderStatus` carry `lastRolloutAt`, `registryErrors`, `sourceErrors`, `providerErrors` and `ownerMismatchRecords`, the
+  shared `status-report.json` gains them in both repos together, and the provider row's change comparison leaves out the volatile
+  fields (`lastSyncAt`, `registryErrors`, `sourceErrors`, `providerErrors`, `reportedAt`), else every status report version-bumps the row. `providerErrors`
+  is external-dns's consecutive soft errors, which rises by one on every failing sync, so it is volatile like the other two counts; a provider
+  that starts or stops failing still changes the row through `lastError`.
+- **Review of the step, resolved:**
+  - `providerErrors` was missing from the volatile set in the restapi spec (7.7, 18.2) and here: added (restapi `f9fd12d`). `lastError` needs no change:
+    it holds no count, and for unreadable pods it names the pod and the reason, so it changes when the cause does (a pod restarted, timeout
+    becoming ECONNREFUSED), not with every report; a flap between two reasons is a state change worth a row version, not churn.
+  - The fixture byte-comparison depended on `core.autocrlf` (Git for Windows sets it): `.gitattributes` now holds `test/fixtures/api/** text eol=lf`
+    here and `test/fixtures/dns-api/** text eol=lf` in restapi (`814ed9c`), so the working-tree bytes are the committed ones; the test asserts the
+    attribute and that no fixture holds a CR (it runs in CI too, where the sibling comparison is skipped).
+  - The publish-gate tests now read each job of `publish.yml` apart: the check job's conditions, no `continue-on-error`, `needs: check` and no `if:`
+    on the publishing job, the tag/version comparison before `docker login` and `docker push`, `latest` only inside the non-prerelease branch.
+    Each was shown to fail on the change it guards (dropping `needs: check`, adding `continue-on-error`, moving the comparison, dropping the
+    attribute, a CRLF fixture).

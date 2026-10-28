@@ -1,2 +1,5 @@
 # Force LF line endings for shell scripts on all platforms
 *.sh text eol=lf
+
+# The contract fixtures are shared byte for byte with restapi (spec 7.3): LF in the working tree whatever core.autocrlf says
+test/fixtures/api/** text eol=lf
