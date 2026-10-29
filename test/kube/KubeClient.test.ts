@@ -232,6 +232,26 @@ describe("httpsTransport", () => {
         );
     });
 
+    it("rejects an answer the server cuts short after its headers, instead of waiting for ever", async () => {
+        for (const cut of ["destroy", "end"] as const) {
+            handler = (req, res) => {
+                res.writeHead(200, { "Content-Length": "100000" });
+                res.write("x".repeat(1000), () => req.socket[cut]());
+            };
+            await expect(httpsTransport(request({ method: "GET", body: undefined, timeoutMs: 1000 }))).rejects.toThrow("the response was cut short");
+        }
+    });
+
+    it("gives up on an answer that trickles in past the timeout, though the socket is never idle for it", async () => {
+        handler = (_req, res) => {
+            res.writeHead(200, { "Content-Length": "100000" });
+            // A byte every 40 ms keeps the socket from ever idling for the timeout.
+            const timer = setInterval(() => res.write("x"), 40);
+            res.on("close", () => clearInterval(timer));
+        };
+        await expect(httpsTransport(request({ method: "GET", body: undefined, timeoutMs: 300 }))).rejects.toThrow("no answer within 300 ms");
+    });
+
     it("refuses an answer larger than the limit", async () => {
         handler = (_req, res) => {
             res.writeHead(200);

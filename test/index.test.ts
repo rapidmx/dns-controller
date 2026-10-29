@@ -85,7 +85,8 @@ describe("startController / runMain", () => {
             DNS_CONTROLLER_RELEASE: "mail",
         };
         fetchCalls = [];
-        listed = {};
+        // An empty namespace answers a list with 200, and the controller lists its instances before it applies one.
+        listed = { "/apis/apps/v1/namespaces/rapidmx/deployments": [] };
         found = {};
         order = [];
         kubeRequests = [];

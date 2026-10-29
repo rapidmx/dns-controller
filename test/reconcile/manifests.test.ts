@@ -217,6 +217,16 @@ describe("externalDnsArgs", () => {
         expect(insecure.slice(-4)).toEqual(["--rfc2136-host=ns1.example.com", "--rfc2136-zone=example.com", "--rfc2136-insecure", "--rfc2136-axfr"]);
     });
 
+    it("gives rfc2136 every zone of the config, its own zone first: external-dns lists and updates only the zones it is given", () => {
+        const options = { hosts: ["ns1.example.com"], zone: "example.org", tsigKeyName: "rapidmx", tsigAlgorithm: "hmac-sha256" };
+        const args = externalDnsArgs(provider({ type: "rfc2136", zones: ["example.com", "example.org", "example.net"], options }), OWNER, "rapidmx");
+        expect(args.filter((arg) => arg.startsWith("--rfc2136-zone="))).toEqual(["--rfc2136-zone=example.org", "--rfc2136-zone=example.com", "--rfc2136-zone=example.net"]);
+        expect(args.filter((arg) => arg.startsWith("--domain-filter="))).toHaveLength(3);
+        // Without a zone option every zone of the config still is one.
+        const bare = externalDnsArgs(provider({ type: "rfc2136", zones: ["example.com", "example.org"], options: { hosts: ["ns1.example.com"] } }), OWNER, "rapidmx");
+        expect(bare.filter((arg) => arg.startsWith("--rfc2136-zone="))).toEqual(["--rfc2136-zone=example.com", "--rfc2136-zone=example.org"]);
+    });
+
     it("passes Google's project and Azure's file, subscription and resource group", () => {
         expect(externalDnsArgs(provider({ type: "google", options: { project: "my-project" } }), OWNER, "rapidmx").slice(-1)).toEqual(["--google-project=my-project"]);
         expect(
@@ -249,6 +259,14 @@ describe("externalDnsArgs", () => {
         ]);
         const deployment = externalDnsDeployment(parent, OWNER, settings, undefined, ["sub.example.com"]);
         expect(container(deployment).args).toContain("--exclude-domains=sub.example.com");
+    });
+
+    it("also keeps an instance out of the zones of a deleted config whose instance still runs, those under its own zones or the same", () => {
+        const parent = provider({ uid: "parent", zones: ["example.com"] });
+        expect(nestedZones(parent, [parent], ["sub.example.com", "example.com", "other.net", "badexample.com"])).toEqual(["sub.example.com", "example.com"]);
+        // Once, though a config has it too.
+        const sub = provider({ uid: "sub", zones: ["sub.example.com"] });
+        expect(nestedZones(parent, [parent, sub], ["sub.example.com"])).toEqual(["sub.example.com"]);
     });
 
     it("ignores options it doesn't know and options of the wrong shape", () => {

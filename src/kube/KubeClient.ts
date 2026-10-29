@@ -46,9 +46,15 @@ export class KubeError extends Error {
  * The default transport: `node:https` with the cluster CA given per request, so the cluster CA is trusted for calls to
  * the API server only (the global `fetch` cannot take a per-request CA without the `undici` package, and
  * `NODE_EXTRA_CA_CERTS` would trust it for every call the process makes). Certificate verification is never off.
+ *
+ * Always settles: `timeoutMs` is the deadline of the whole request (connecting, the answer's headers and its body), and
+ * an answer the server cuts short once it has started is refused. The socket's idle timeout would do for neither: a
+ * server that trickles bytes is never idle, and a closed socket never times out. A promise left waiting for the end of
+ * a body that is not coming would stall the Lease, the reconciler and the shutdown for good.
  */
 export function httpsTransport(request: KubeRequest): Promise<KubeResponse> {
-    return new Promise((resolve, reject) => {
+    let deadline: NodeJS.Timeout | undefined;
+    return new Promise<KubeResponse>((resolve, reject) => {
         const req = https.request(
             request.url,
             {
@@ -56,7 +62,6 @@ export function httpsTransport(request: KubeRequest): Promise<KubeResponse> {
                 headers: request.headers,
                 ca: request.ca,
                 rejectUnauthorized: true,
-                timeout: request.timeoutMs,
             },
             (res) => {
                 const chunks: Buffer[] = [];
@@ -70,12 +75,18 @@ export function httpsTransport(request: KubeRequest): Promise<KubeResponse> {
                     chunks.push(chunk);
                 });
                 res.on("end", () => resolve({ status: Number(res.statusCode), body: Buffer.concat(chunks).toString("utf8") }));
+                // The connection closed before the body ended: `end` never comes, and `res` has no error listener to hear of it.
+                res.on("close", () => {
+                    if (!res.complete) {
+                        reject(new Error("the response was cut short"));
+                    }
+                });
             }
         );
-        req.on("timeout", () => req.destroy(new Error(`no answer within ${request.timeoutMs} ms`)));
+        deadline = setTimeout(() => req.destroy(new Error(`no answer within ${request.timeoutMs} ms`)), request.timeoutMs);
         req.on("error", reject);
         req.end(request.body);
-    });
+    }).finally(() => clearTimeout(deadline));
 }
 
 export interface KubeClientOptions {

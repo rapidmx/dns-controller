@@ -236,7 +236,9 @@ function providerArgs(provider: DnsProviderV1): string[] {
             listOption(provider, "hosts").forEach((host) => flag("rfc2136-host", host));
             const port: unknown = provider.options.port;
             flag("rfc2136-port", typeof port === "number" ? String(port) : undefined);
-            flag("rfc2136-zone", textOption(provider, "zone"));
+            // Every zone of the config, the option's first: external-dns lists (AXFR) and updates only the zones it is given, and
+            // sends a change for a name under none of them to the root zone, which the server refuses on every sync.
+            [...new Set([textOption(provider, "zone"), ...provider.zones])].forEach((zone) => flag("rfc2136-zone", zone));
             flag("rfc2136-tsig-keyname", textOption(provider, "tsigKeyName"));
             flag("rfc2136-tsig-secret-alg", textOption(provider, "tsigAlgorithm"));
             if (provider.options.insecure === true) {
@@ -262,16 +264,22 @@ function providerArgs(provider: DnsProviderV1): string[] {
  * The zones of the other provider configs that lie under one of `provider`'s zones (`sub.example.com` under
  * `example.com`): its instance is kept out of them with `--exclude-domains`. Every instance shares the owner id, so
  * without it the parent's instance would take the nested config's records for its own and delete them on every sync.
+ *
+ * `pendingZones` are the zones of deleted configs whose instance still runs, for its last interval: that instance
+ * deletes every record the owner id marks in its zones, now including the ones this instance would publish there, so
+ * these are kept out too, the same zone as one of `provider`'s own as well, until the instance is gone.
  */
-export function nestedZones(provider: DnsProviderV1, providers: DnsProviderV1[]): string[] {
+export function nestedZones(provider: DnsProviderV1, providers: DnsProviderV1[], pendingZones: string[] = []): string[] {
     const nested: string[] = [];
-    for (const other of providers.filter((p) => p.uid !== provider.uid)) {
-        for (const zone of other.zones) {
-            if (provider.zones.some((own) => zone.endsWith(`.${own}`)) && !nested.includes(zone)) {
-                nested.push(zone);
-            }
+    const add = (zone: string, equalToo: boolean): void => {
+        if (provider.zones.some((own) => zone.endsWith(`.${own}`) || (equalToo && zone === own)) && !nested.includes(zone)) {
+            nested.push(zone);
         }
+    };
+    for (const other of providers.filter((p) => p.uid !== provider.uid)) {
+        other.zones.forEach((zone) => add(zone, false));
     }
+    pendingZones.forEach((zone) => add(zone, true));
     return nested;
 }
 

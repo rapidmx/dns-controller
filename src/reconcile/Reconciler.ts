@@ -77,10 +77,19 @@ const PROVIDER_UID: RegExp = /^[a-z0-9]([a-z0-9-]{0,38}[a-z0-9])?$/;
 /** A zone as the server normalizes them: a lowercase domain name of at least two labels (never a top-level domain alone). */
 const ZONE: RegExp = /^(?=.{1,253}$)[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?(\.[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?)+$/;
 
-/** An object a list returned. It carries the controller's labels: the list selected it by them. */
+/** An object a list returned. It carries the controller's labels: the list selected it by them. A Deployment carries its pod template too. */
 interface Listed {
     metadata: { name: string; labels: Record<string, string> };
+    spec?: { template: { spec: { containers: { args?: string[] }[] } } };
 }
+
+/** A deleted provider's instance that is still there: its Deployment's name and the zones it is filtered to (its `--domain-filter`s). */
+interface GoneInstance {
+    name: string;
+    zones: string[];
+}
+
+const DOMAIN_FILTER = "--domain-filter=";
 
 /** An object the API server answered an apply with: all the controller needs from it is its uid. */
 interface Applied {
@@ -336,7 +345,7 @@ export class Reconciler {
      * is not the one just applied (one recreated by hand gets a new uid, and the garbage collector would take the Secret
      * with the old one). True while newer credentials are still on their way.
      */
-    private async applyProvider(state: DesiredStateV1, provider: DnsProviderV1, imageAccepted: boolean, step: Step): Promise<boolean> {
+    private async applyProvider(state: DesiredStateV1, provider: DnsProviderV1, imageAccepted: boolean, step: Step, pendingZones: string[]): Promise<boolean> {
         const { settings } = this.options;
         const wanted: number | undefined = provider.credentials?.generation;
         const secret: SecretState | undefined = await this.readSecret(provider);
@@ -351,7 +360,7 @@ export class Reconciler {
         if (imageAccepted) {
             step.step = "apply";
             step.kind = "Deployment";
-            deployment = await this.applyDeployment(state, provider, secret ? (held ?? UNKNOWN_GENERATION) : wanted);
+            deployment = await this.applyDeployment(state, provider, secret ? (held ?? UNKNOWN_GENERATION) : wanted, pendingZones);
         }
         if (wanted === undefined) {
             // No credentials: no Secret, and one this controller wrote before goes, once the Deployment no longer refers to it.
@@ -392,17 +401,35 @@ export class Reconciler {
         if (written && imageAccepted && secret && held !== wanted) {
             // The Secret held older (or unknown) credentials, and the pod template said so: now that it holds the new ones, this apply rolls the pod.
             step.kind = "Deployment";
-            await this.applyDeployment(state, provider, wanted);
+            await this.applyDeployment(state, provider, wanted, pendingZones);
         }
         return !written;
     }
 
-    private applyDeployment(state: DesiredStateV1, provider: DnsProviderV1, credentialsGeneration: number | undefined): Promise<Applied> {
+    private applyDeployment(state: DesiredStateV1, provider: DnsProviderV1, credentialsGeneration: number | undefined, pendingZones: string[]): Promise<Applied> {
         const { settings } = this.options;
         return this.apply(
             this.collection("/apis/apps/v1", "deployments"),
-            externalDnsDeployment(provider, state.ownerId, settings, credentialsGeneration, nestedZones(provider, state.providers))
+            externalDnsDeployment(provider, state.ownerId, settings, credentialsGeneration, nestedZones(provider, state.providers, pendingZones))
         );
+    }
+
+    /**
+     * The deleted providers' instances among `deployments`: one labelled for a uid the state no longer has. Secrets are never
+     * listed; the instance is the one mark of a deleted provider. Read from the cluster, not remembered, so a controller that
+     * took over the Lease (or restarted) in that interval knows them too.
+     */
+    private goneInstances(state: DesiredStateV1, deployments: Listed[]): Map<string, GoneInstance> {
+        const desired: Set<string> = new Set(state.providers.map((p) => p.uid));
+        const gone: Map<string, GoneInstance> = new Map();
+        for (const item of deployments) {
+            const uid: string = item.metadata.labels[LABEL_PROVIDER];
+            if (!desired.has(uid)) {
+                const args: string[] = (item.spec?.template.spec.containers ?? []).flatMap((container) => container.args ?? []);
+                gone.set(uid, { name: item.metadata.name, zones: args.filter((arg) => arg.startsWith(DOMAIN_FILTER)).map((arg) => arg.slice(DOMAIN_FILTER.length)) });
+            }
+        }
+        return gone;
     }
 
     /**
@@ -486,11 +513,19 @@ export class Reconciler {
                 log.error("external_dns_image_refused", { image: state.externalDnsImage, pin: settings.externalDnsImage });
                 failed = true;
             }
+            // The instances of deleted providers come first: they keep running for an interval, and the instances applied here must
+            // stay out of their zones until they are gone. Nothing is applied on a guess when they can't be listed.
+            let listedDeployments: Listed[] = [];
+            const listed: boolean = await attempt({ step: "list", kind: "Deployment" }, async () => {
+                listedDeployments = await this.list(this.collection("/apis/apps/v1", "deployments"));
+            });
+            const gone: Map<string, GoneInstance> = this.goneInstances(state, listedDeployments);
+            const pendingZones: string[] = [...gone.values()].flatMap((instance) => instance.zones);
             const types: Map<string, DnsProviderV1["type"]> = new Map(state.providers.map((p) => [p.uid, p.type]));
-            for (const provider of state.providers) {
+            for (const provider of listed ? state.providers : []) {
                 const step: Step = { step: "read", kind: "Secret", providerUid: provider.uid };
                 await attempt(step, async () => {
-                    failed = (await this.applyProvider(state, provider, imageAccepted, step)) || failed;
+                    failed = (await this.applyProvider(state, provider, imageAccepted, step, pendingZones)) || failed;
                 });
             }
             const endpoints: string = this.collection("/apis/externaldns.k8s.io/v1alpha1", "dnsendpoints");
@@ -498,7 +533,7 @@ export class Reconciler {
                 const manifest: Manifest = dnsEndpoint(set, types.get(set.providerUid) as DnsProviderV1["type"], settings);
                 await attempt({ step: "apply", kind: "DNSEndpoint", name: manifest.metadata.name }, () => this.apply(endpoints, manifest));
             }
-            let nextAt: number | undefined = await this.prune(state, attempt);
+            let nextAt: number | undefined = listed ? await this.prune(state, attempt, gone) : undefined;
             let pending = false;
             const { operations } = this.options;
             if (operations && imageAccepted) {
@@ -522,21 +557,17 @@ export class Reconciler {
 
     /**
      * Deletes what the state no longer has; returns when the next removal of a deleted provider is due. Nothing of a
-     * deleted provider is removed while its endpoints couldn't all be listed and deleted.
+     * deleted provider is removed while its endpoints couldn't all be listed and deleted. `gone` are the deleted providers'
+     * instances (`goneInstances()`), listed at the start of the pass.
      */
-    private async prune(state: DesiredStateV1, attempt: Attempt): Promise<number | undefined> {
+    private async prune(state: DesiredStateV1, attempt: Attempt, gone: Map<string, GoneInstance>): Promise<number | undefined> {
         const { settings } = this.options;
         const endpoints: string = this.collection("/apis/externaldns.k8s.io/v1alpha1", "dnsendpoints");
         const deployments: string = this.collection("/apis/apps/v1", "deployments");
         let listedEndpoints: Listed[] = [];
-        let listedDeployments: Listed[] = [];
-        const listed: boolean =
-            (await attempt({ step: "list", kind: "DNSEndpoint" }, async () => {
-                listedEndpoints = await this.list(endpoints);
-            })) &&
-            (await attempt({ step: "list", kind: "Deployment" }, async () => {
-                listedDeployments = await this.list(deployments);
-            }));
+        const listed: boolean = await attempt({ step: "list", kind: "DNSEndpoint" }, async () => {
+            listedEndpoints = await this.list(endpoints);
+        });
         if (!listed) {
             return undefined;
         }
@@ -551,16 +582,6 @@ export class Reconciler {
             }
         }
 
-        // The deleted providers: an instance labelled for a uid the state no longer has. Secrets are never listed; the
-        // instance is the one mark of a deleted provider.
-        const desired: Set<string> = new Set(state.providers.map((p) => p.uid));
-        const gone: Map<string, string> = new Map();
-        for (const item of listedDeployments) {
-            const uid: string = item.metadata.labels[LABEL_PROVIDER];
-            if (!desired.has(uid)) {
-                gone.set(uid, item.metadata.name);
-            }
-        }
         // A provider that came back, or whose instance is gone, starts over if it is deleted again.
         for (const uid of this.removals.keys()) {
             if (!gone.has(uid)) {
@@ -569,7 +590,7 @@ export class Reconciler {
         }
         let nextAt: number | undefined;
         const now: number = this.now();
-        for (const [uid, deployment] of gone) {
+        for (const [uid, instance] of gone) {
             if (endpointsLeft.has(uid)) {
                 continue;
             }
@@ -581,7 +602,12 @@ export class Reconciler {
                 continue;
             }
             const step: Step = { step: "delete", kind: "Secret", providerUid: uid };
-            await attempt(step, () => this.removeProvider(uid, deployment, deployments, step));
+            if (await attempt(step, () => this.removeProvider(uid, instance.name, deployments, step))) {
+                // The zones it was kept out of are the instances' again: a pass of their own applies them without the exclusion.
+                if (instance.zones.some((zone) => state.providers.some((p) => nestedZones(p, [], [zone]).length > 0))) {
+                    this.again = true;
+                }
+            }
         }
         return nextAt;
     }

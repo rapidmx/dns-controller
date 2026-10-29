@@ -445,3 +445,35 @@ on `main`, so the first release carries all five (the spec now says so). Nothing
     on the publishing job, the tag/version comparison before `docker login` and `docker push`, `latest` only inside the non-prerelease branch.
     Each was shown to fail on the change it guards (dropping `needs: check`, adding `continue-on-error`, moving the comparison, dropping the
     attribute, a CRLF fixture).
+
+## 2026-10-28: DNS review round 1 fixes
+
+- **`httpsTransport` always settles (finding 113).** A server that cut the connection after the answer's headers left the
+  promise pending for good (`res` has no error listener, `end` never comes, the socket's idle timeout can't fire on a closed
+  socket), which stalled the Lease loop, the reconciler, the status reports and `stop()` while `/healthz` stayed green. Now
+  `res` `close` before `complete` rejects ("the response was cut short"), and `timeoutMs` is a deadline for the whole request
+  (a timer destroying the request, cleared when the promise settles) instead of the socket's idle timeout, which a server
+  trickling bytes never reaches. Tests use a real TLS server that destroys / ends the socket mid-body and one that trickles.
+- **A deleted provider's zones stay out of the instances that now cover them (finding 114).** The instance of a deleted config
+  runs for `providerRemovalDelayMs` and, sharing the owner id, deletes every record in its zones, including the ones the
+  parent's instance publishes there once the server moves the domain. A pass now lists the Deployments first
+  (`goneInstances()`: the zones are the `--domain-filter`s of the instance's own container, read from the cluster, so a new
+  Lease holder or a restart knows them too), and `nestedZones()` takes them as `pendingZones` (a zone equal to one of the
+  instance's own as well: a new config with a deleted config's zone). When the instance is removed and its zones had been
+  excluded, the pass sets `again`, so the instances are applied without the exclusion at once rather than at the resync. The
+  Deployments are listed before anything is applied, and no instance is applied when they can't be listed (nothing is guessed;
+  the endpoints still are); `prune()` takes the same list. Operation Jobs keep `nestedZones(provider, providers)`: they run the
+  noop registry with `upsert-only` and delete nothing. Deliberately left: while the old instance runs, the domain moved to the
+  parent is not published (it was already dark: the old instance removes its records once its endpoints go).
+- **rfc2136 gets every zone (finding 115).** `--rfc2136-zone` is passed once per zone of the config, the `zone` option first
+  (external-dns lists by AXFR and updates only the zones it is given, and sends a change under none of them to the root
+  zone). The restapi rule "zone must be one of zones" stays; its spec needs an "As implemented" note (not done here: another repo).
+- **Review of the round 1 fixes, two low findings, nothing changed.**
+  - *A moved domain has a gap while the old instance runs.* Deliberate, and not new: the old instance removes the domain's records
+    once its endpoints go, the same as before the exclusion existed (restapi's spec says a reassignment briefly removes them, and the
+    console warns). The exclusion only stops the two instances fighting over the records. `providerRemovalDelayMs` is what lets the
+    old instance clean up; skipping it when a remaining provider covers the zone would rest on how external-dns v0.23.0 behaves with a
+    shared owner id, which can't be tested here, so it is left. If the gap proves too long in live use, that is the place to shorten it.
+  - *No instance is applied while the Deployments can't be listed.* Kept. Which provider has a deleted instance nested under it is
+    exactly what the list tells; applying on a guess brings the flapping of 114 back. A list the API server refuses means its writes
+    are failing as well, and the pass is retried with backoff; the DNSEndpoints are still applied meanwhile.

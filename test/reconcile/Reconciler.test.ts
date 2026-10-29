@@ -309,6 +309,83 @@ describe("Reconciler", () => {
         expect(args("mail-external-dns-sub").some((a) => a.startsWith("--exclude-domains="))).toBe(false);
     });
 
+    describe("a deleted provider's instance, which runs for one more interval", () => {
+        const PARENT = "mail-external-dns-cloudflare-main";
+        const args = (name: string): string[] =>
+            (kube.objects.get(`${DEPLOYMENTS}/${name}`) as unknown as { spec: { template: { spec: { containers: { args: string[] }[] } } } }).spec.template.spec
+                .containers[0].args;
+        /** The Deployment a deleted config's instance still has, filtered to `zones` as the controller made it. */
+        const instance = (uid: string, zones: string[]): void => {
+            kube.put(`${DEPLOYMENTS}/mail-external-dns-${uid}`, ours(uid));
+            (kube.objects.get(`${DEPLOYMENTS}/mail-external-dns-${uid}`) as unknown as Record<string, unknown>).spec = {
+                // A container without arguments filters nothing.
+                template: { spec: { containers: [{}, { args: ["--source=crd", ...zones.map((zone) => `--domain-filter=${zone}`)] }] } },
+            };
+        };
+
+        it("keeps the instance of the parent zone out of the deleted nested config's zone until that instance is gone", async () => {
+            // sub.example.com was a config of its own; deleted, its domain moved to the parent's config.
+            instance("sub", ["sub.example.com"]);
+            const r = reconciler({ providerRemovalDelayMs: 120000 });
+            expect(await r.reconcile(fixture())).toEqual({ result: "done", nextAt: clock + 120000 });
+            // Else the nested instance, still syncing under the shared owner id, deletes what the parent publishes there.
+            expect(args(PARENT)).toContain("--exclude-domains=sub.example.com");
+            clock += 120000;
+            expect(await r.reconcile(fixture())).toEqual({ result: "done" });
+            expect(kube.objects.has(`${DEPLOYMENTS}/mail-external-dns-sub`)).toBe(false);
+            // The pass that follows the removal is the parent's, without the exclusion.
+            expect(await r.reconcile(fixture())).toEqual({ result: "done" });
+            expect(args(PARENT).some((a) => a.startsWith("--exclude-domains="))).toBe(false);
+        });
+
+        it("asks for that pass itself, at once, and for no other", async () => {
+            vi.useFakeTimers();
+            instance("sub", ["sub.example.com"]);
+            instance("unrelated", ["example.net"]);
+            const r = reconciler({ resyncMs: 600000, providerRemovalDelayMs: 120000, now: Date.now });
+            const passes = vi.spyOn(r, "reconcile");
+            r.update(fixture());
+            await vi.advanceTimersByTimeAsync(0);
+            expect(passes).toHaveBeenCalledTimes(1);
+            expect(args(PARENT)).toContain("--exclude-domains=sub.example.com");
+            expect(args(PARENT)).not.toContain("--exclude-domains=example.net");
+            await vi.advanceTimersByTimeAsync(120000);
+            // The removal pass, then the parent's without the exclusion.
+            expect(passes).toHaveBeenCalledTimes(3);
+            expect(args(PARENT).some((a) => a.startsWith("--exclude-domains="))).toBe(false);
+            expect(kube.objects.has(`${DEPLOYMENTS}/mail-external-dns-unrelated`)).toBe(false);
+            await r.stop();
+        });
+
+        it("asks for no further pass when the removal of an instance outside every zone is all there was", async () => {
+            vi.useFakeTimers();
+            instance("unrelated", ["example.net"]);
+            const r = reconciler({ resyncMs: 600000, providerRemovalDelayMs: 0, now: Date.now });
+            const passes = vi.spyOn(r, "reconcile");
+            r.update(fixture());
+            await vi.advanceTimersByTimeAsync(0);
+            expect(passes).toHaveBeenCalledTimes(1);
+            expect(kube.objects.has(`${DEPLOYMENTS}/mail-external-dns-unrelated`)).toBe(false);
+            await r.stop();
+        });
+
+        it("keeps the zone of a deleted config out of a new config that has the same zone", async () => {
+            instance("old", ["example.com"]);
+            const state = fixture();
+            expect(await reconciler({ providerRemovalDelayMs: 120000 }).reconcile(state)).toMatchObject({ result: "done" });
+            expect(args(PARENT)).toContain("--exclude-domains=example.com");
+        });
+
+        it("applies no instance when it can't tell which deleted instances are still there", async () => {
+            kube.failures.set(`GET ${DEPLOYMENTS}?`, new KubeError("boom", 500));
+            expect(await reconciler().reconcile(fixture())).toMatchObject({ result: "incomplete" });
+            expect(kube.objects.has(DEPLOYMENT)).toBe(false);
+            expect(kube.writes().some((w) => w.includes("/deployments/"))).toBe(false);
+            // The endpoints are the providers', not the instances': they still are applied.
+            expect(kube.objects.has(ENDPOINT)).toBe(true);
+        });
+    });
+
     it("deletes the DNSEndpoints it manages that the desired state no longer has, and nothing it doesn't manage", async () => {
         kube.put(`${ENDPOINTS}/mail-domain-gone-com`, { ...ours("cloudflare-main"), "rapidmx.io/domain": "gone.com" });
         kube.put(`${ENDPOINTS}/someone-elses`, { "app.kubernetes.io/managed-by": "someone" });
