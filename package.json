@@ -1,6 +1,6 @@
 {
   "name": "dns-controller",
-  "version": "0.0.0",
+  "version": "0.1.0",
   "private": true,
   "description": "Publishes a RapidMX deployment's DNS records through external-dns: the only RapidMX component allowed to create or change Kubernetes objects.",
   "type": "module",
