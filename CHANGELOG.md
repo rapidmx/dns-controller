@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.1] - 2026-11-05
+
+### Added
+- Added the RapidREST Claude Code plugin to the project settings
+
+### Changed
+- Upgrade every other dependency to its latest release, keeping typescript on 6.x
+- Install corepack globally before enabling it in CI, since the node:lts images no longer bundle it
+
 ## [0.1.0] - 2026-10-29
 
 ### Added
@@ -76,5 +85,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Removed
 - Removed the controller's internal API, its ServiceAccount token verifier and the settings DNS_CONTROLLER_API_PORT, DNS_CONTROLLER_API_AUDIENCE and DNS_CONTROLLER_SERVER_SUBJECT, leaving only the health port listening
 
-[Unreleased]: https://github.com/rapidmx/dns-controller/compare/v0.1.0...HEAD
+[Unreleased]: https://github.com/rapidmx/dns-controller/compare/v0.1.1...HEAD
+[0.1.1]: https://github.com/rapidmx/dns-controller/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/rapidmx/dns-controller/releases/tag/v0.1.0
